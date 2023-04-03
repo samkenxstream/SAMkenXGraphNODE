@@ -10,12 +10,12 @@ pub mod status;
 
 pub use features::{SubgraphFeature, SubgraphFeatureValidationError};
 
-use anyhow::{anyhow, Error};
+use anyhow::{anyhow, Context, Error};
 use futures03::{future::try_join3, stream::FuturesOrdered, TryStreamExt as _};
 use semver::Version;
 use serde::{de, ser};
 use serde_yaml;
-use slog::{info, Logger};
+use slog::Logger;
 use stable_hash::{FieldAddress, StableHash};
 use stable_hash_legacy::SequenceNumber;
 use std::{collections::BTreeSet, marker::PhantomData};
@@ -28,12 +28,12 @@ use crate::{
     blockchain::{BlockPtr, Blockchain, DataSource as _},
     components::{
         link_resolver::LinkResolver,
-        store::{DeploymentLocator, StoreError, SubgraphStore},
+        store::{StoreError, SubgraphStore},
     },
     data::{
         graphql::TryFromValue,
         query::QueryExecutionError,
-        schema::{Schema, SchemaImportError, SchemaValidationError},
+        schema::{Schema, SchemaValidationError},
         store::Entity,
         subgraph::features::validate_subgraph_features,
     },
@@ -68,7 +68,7 @@ where
 
 /// The IPFS hash used to identifiy a deployment externally, i.e., the
 /// `Qm..` string that `graph-cli` prints when deploying to a subgraph
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct DeploymentHash(String);
 
 impl stable_hash_legacy::StableHash for DeploymentHash {
@@ -304,8 +304,6 @@ pub enum SubgraphAssignmentProviderError {
     /// Occurs when attempting to remove a subgraph that's not hosted.
     #[error("Subgraph with ID {0} already running")]
     AlreadyRunning(DeploymentHash),
-    #[error("Subgraph with ID {0} is not running")]
-    NotRunning(DeploymentLocator),
     #[error("Subgraph provider error: {0}")]
     Unknown(#[from] anyhow::Error),
 }
@@ -314,12 +312,6 @@ impl From<::diesel::result::Error> for SubgraphAssignmentProviderError {
     fn from(e: ::diesel::result::Error) -> Self {
         SubgraphAssignmentProviderError::Unknown(e.into())
     }
-}
-
-#[derive(Error, Debug)]
-pub enum SubgraphManifestValidationWarning {
-    #[error("schema validation produced warnings: {0:?}")]
-    SchemaValidationWarning(SchemaImportError),
 }
 
 #[derive(Error, Debug)]
@@ -334,8 +326,6 @@ pub enum SubgraphManifestValidationError {
     EthereumNetworkRequired,
     #[error("the specified block must exist on the Ethereum network")]
     BlockNotFound(String),
-    #[error("imported schema(s) are invalid: {0:?}")]
-    SchemaImportError(Vec<SchemaImportError>),
     #[error("schema validation failed: {0:?}")]
     SchemaValidationError(Vec<SchemaValidationError>),
     #[error("the graft base is invalid: {0}")]
@@ -390,9 +380,10 @@ impl UnresolvedSchema {
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<Schema, anyhow::Error> {
-        info!(logger, "Resolve schema"; "link" => &self.file.link);
-
-        let schema_bytes = resolver.cat(logger, &self.file).await?;
+        let schema_bytes = resolver
+            .cat(logger, &self.file)
+            .await
+            .with_context(|| format!("failed to resolve schema {}", &self.file.link))?;
         Schema::parse(&String::from_utf8(schema_bytes)?, id)
     }
 }
@@ -469,7 +460,7 @@ impl Graft {
             //
             // The developer should change their `graft.block` in the manifest
             // to `base.block - 1` or less.
-            (Some(ptr), false) if !(self.block < ptr.number) => Err(GraftBaseInvalid(format!(
+            (Some(ptr), false) if self.block >= ptr.number => Err(GraftBaseInvalid(format!(
                 "failed to graft onto `{}` at block {} since it's not healthy. You can graft it starting at block {} backwards",
                 self.base, self.block, ptr.number - 1
             ))),
@@ -535,8 +526,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
         store: Arc<S>,
         validate_graft_base: bool,
     ) -> Result<SubgraphManifest<C>, Vec<SubgraphManifestValidationError>> {
-        let (schemas, _) = self.0.schema.resolve_schema_references(store.clone());
-
         let mut errors: Vec<SubgraphManifestValidationError> = vec![];
 
         // Validate that the manifest has at least one data source
@@ -571,7 +560,7 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
 
         self.0
             .schema
-            .validate(&schemas)
+            .validate()
             .err()
             .into_iter()
             .for_each(|schema_errors| {
@@ -581,11 +570,6 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             });
 
         if let Some(graft) = &self.0.graft {
-            if ENV_VARS.disable_grafts {
-                errors.push(SubgraphManifestValidationError::GraftBaseInvalid(
-                    "Grafting of subgraphs is currently disabled".to_owned(),
-                ));
-            }
             if validate_graft_base {
                 if let Err(graft_err) = graft.validate(store).await {
                     errors.push(graft_err);
@@ -729,18 +713,18 @@ impl<C: Blockchain> UnresolvedSubgraphManifest<C> {
         }
 
         let (schema, data_sources, templates) = try_join3(
-            schema.resolve(id.clone(), &resolver, logger),
+            schema.resolve(id.clone(), resolver, logger),
             data_sources
                 .into_iter()
                 .enumerate()
-                .map(|(idx, ds)| ds.resolve(&resolver, logger, idx as u32))
+                .map(|(idx, ds)| ds.resolve(resolver, logger, idx as u32))
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),
             templates
                 .into_iter()
                 .enumerate()
                 .map(|(idx, template)| {
-                    template.resolve(&resolver, logger, ds_count as u32 + idx as u32)
+                    template.resolve(resolver, logger, ds_count as u32 + idx as u32)
                 })
                 .collect::<FuturesOrdered<_>>()
                 .try_collect::<Vec<_>>(),

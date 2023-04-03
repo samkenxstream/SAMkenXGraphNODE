@@ -6,8 +6,11 @@ use diesel::{
     sql_types::{Array, Double, Nullable, Text},
     ExpressionMethods, QueryDsl,
 };
+use graph::components::store::EntityType;
 use graph::components::store::VersionStats;
-use std::collections::{HashMap, HashSet};
+use graph::prelude::BlockNumber;
+use itertools::Itertools;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write;
 use std::iter::FromIterator;
 use std::sync::Arc;
@@ -36,12 +39,61 @@ table! {
     }
 }
 
-// Readonly; we only access the name
+// Readonly;  not all columns are mapped
 table! {
-    pg_namespace(nspname) {
-        nspname -> Text,
+    pg_namespace(oid) {
+        oid -> Oid,
+        #[sql_name = "nspname"]
+        name -> Text,
     }
 }
+// Readonly; only mapping the columns we want
+table! {
+    pg_database(datname) {
+        datname -> Text,
+        datcollate -> Text,
+        datctype -> Text,
+    }
+}
+
+// Readonly; not all columns are mapped
+table! {
+    pg_class(oid) {
+        oid -> Oid,
+        #[sql_name = "relname"]
+        name -> Text,
+        #[sql_name = "relnamespace"]
+        namespace -> Oid,
+        #[sql_name = "relpages"]
+        pages -> Integer,
+        #[sql_name = "reltuples"]
+        tuples -> Integer,
+        #[sql_name = "relkind"]
+        kind -> Char,
+        #[sql_name = "relnatts"]
+        natts -> Smallint,
+    }
+}
+
+// Readonly; not all columns are mapped
+table! {
+    pg_attribute(oid) {
+        #[sql_name = "attrelid"]
+        oid -> Oid,
+        #[sql_name = "attrelid"]
+        relid -> Oid,
+        #[sql_name = "attname"]
+        name -> Text,
+        #[sql_name = "attnum"]
+        num -> Smallint,
+        #[sql_name = "attstattarget"]
+        stats_target -> Integer,
+    }
+}
+
+joinable!(pg_class -> pg_namespace(namespace));
+joinable!(pg_attribute -> pg_class(relid));
+allow_tables_to_appear_in_same_query!(pg_class, pg_namespace, pg_attribute);
 
 table! {
     subgraphs.table_stats {
@@ -49,6 +101,7 @@ table! {
         deployment -> Integer,
         table_name -> Text,
         is_account_like -> Nullable<Bool>,
+        last_pruned_block -> Nullable<Integer>,
     }
 }
 
@@ -65,23 +118,70 @@ lazy_static! {
         SqlName::verbatim("__diesel_schema_migrations".to_string());
 }
 
-// In debug builds (for testing etc.) create exclusion constraints, in
-// release builds for production, skip them
-#[cfg(debug_assertions)]
-const CREATE_EXCLUSION_CONSTRAINT: bool = true;
-#[cfg(not(debug_assertions))]
-const CREATE_EXCLUSION_CONSTRAINT: bool = false;
+pub struct Locale {
+    collate: String,
+    ctype: String,
+    encoding: String,
+}
+
+impl Locale {
+    /// Load locale information for current database
+    pub fn load(conn: &PgConnection) -> Result<Locale, StoreError> {
+        use diesel::dsl::sql;
+        use pg_database as db;
+
+        let (collate, ctype, encoding) = db::table
+            .filter(db::datname.eq(sql("current_database()")))
+            .select((
+                db::datcollate,
+                db::datctype,
+                sql::<Text>("pg_encoding_to_char(encoding)::text"),
+            ))
+            .get_result::<(String, String, String)>(conn)?;
+        Ok(Locale {
+            collate,
+            ctype,
+            encoding,
+        })
+    }
+
+    pub fn suitable(&self) -> Result<(), String> {
+        if self.collate != "C" {
+            return Err(format!(
+                "database collation is `{}` but must be `C`",
+                self.collate
+            ));
+        }
+        if self.ctype != "C" {
+            return Err(format!(
+                "database ctype is `{}` but must be `C`",
+                self.ctype
+            ));
+        }
+        if self.encoding != "UTF8" {
+            return Err(format!(
+                "database encoding is `{}` but must be `UTF8`",
+                self.encoding
+            ));
+        }
+        Ok(())
+    }
+}
 
 /// Information about what tables and columns we have in the database
 #[derive(Debug, Clone)]
 pub struct Catalog {
     pub site: Arc<Site>,
     text_columns: HashMap<String, HashSet<String>>,
+
     pub use_poi: bool,
     /// Whether `bytea` columns are indexed with just a prefix (`true`) or
     /// in their entirety. This influences both DDL generation and how
     /// queries are generated
     pub use_bytea_prefix: bool,
+
+    /// Set of tables which have an explicit causality region column.
+    pub(crate) entities_with_causality_region: BTreeSet<EntityType>,
 }
 
 impl Catalog {
@@ -90,6 +190,7 @@ impl Catalog {
         conn: &PgConnection,
         site: Arc<Site>,
         use_bytea_prefix: bool,
+        entities_with_causality_region: Vec<EntityType>,
     ) -> Result<Self, StoreError> {
         let text_columns = get_text_columns(conn, &site.namespace)?;
         let use_poi = supports_proof_of_indexing(conn, &site.namespace)?;
@@ -98,11 +199,15 @@ impl Catalog {
             text_columns,
             use_poi,
             use_bytea_prefix,
+            entities_with_causality_region: entities_with_causality_region.into_iter().collect(),
         })
     }
 
     /// Return a new catalog suitable for creating a new subgraph
-    pub fn for_creation(site: Arc<Site>) -> Self {
+    pub fn for_creation(
+        site: Arc<Site>,
+        entities_with_causality_region: BTreeSet<EntityType>,
+    ) -> Self {
         Catalog {
             site,
             text_columns: HashMap::default(),
@@ -111,18 +216,23 @@ impl Catalog {
             // DDL generation creates indexes for prefixes of bytes columns
             // see: attr-bytea-prefix
             use_bytea_prefix: true,
+            entities_with_causality_region,
         }
     }
 
     /// Make a catalog as if the given `schema` did not exist in the database
     /// yet. This function should only be used in situations where a database
     /// connection is definitely not available, such as in unit tests
-    pub fn for_tests(site: Arc<Site>) -> Result<Self, StoreError> {
+    pub fn for_tests(
+        site: Arc<Site>,
+        entities_with_causality_region: BTreeSet<EntityType>,
+    ) -> Result<Self, StoreError> {
         Ok(Catalog {
             site,
             text_columns: HashMap::default(),
             use_poi: false,
             use_bytea_prefix: true,
+            entities_with_causality_region,
         })
     }
 
@@ -133,12 +243,6 @@ impl Catalog {
             .get(table.as_str())
             .map(|cols| cols.contains(column.as_str()))
             .unwrap_or(false)
-    }
-
-    /// Whether to create exclusion indexes; if false, create gist indexes
-    /// w/o an exclusion constraint
-    pub fn create_exclusion_constraint() -> bool {
-        CREATE_EXCLUSION_CONSTRAINT
     }
 }
 
@@ -189,7 +293,7 @@ pub fn table_exists(
         .bind::<Text, _>(namespace)
         .bind::<Text, _>(table.as_str())
         .load(conn)?;
-    Ok(result.len() > 0)
+    Ok(!result.is_empty())
 }
 
 pub fn supports_proof_of_indexing(
@@ -200,49 +304,6 @@ pub fn supports_proof_of_indexing(
         static ref POI_TABLE_NAME: SqlName = SqlName::verbatim(POI_TABLE.to_owned());
     }
     table_exists(conn, namespace.as_str(), &POI_TABLE_NAME)
-}
-
-/// Whether the given table has an exclusion constraint. When we create
-/// tables, they either have an exclusion constraint on `(id, block_range)`,
-/// or just a GIST index on those columns. If this returns `true`, there is
-/// an exclusion constraint on the table, if it returns `false` we only have
-/// an index.
-///
-/// This function only checks whether there is some exclusion constraint on
-/// the table since checking fully if that is exactly the constraint we
-/// think it is is a bit more complex. But if the table is part of a
-/// deployment that we created, the conclusions in hte previous paragraph
-/// are true.
-pub fn has_exclusion_constraint(
-    conn: &PgConnection,
-    namespace: &Namespace,
-    table: &SqlName,
-) -> Result<bool, StoreError> {
-    #[derive(Debug, QueryableByName)]
-    struct Row {
-        #[sql_type = "Bool"]
-        #[allow(dead_code)]
-        uses_excl: bool,
-    }
-
-    let query = "
-        select count(*) > 0 as uses_excl
-          from pg_catalog.pg_constraint con,
-               pg_catalog.pg_class rel,
-               pg_catalog.pg_namespace nsp
-         where rel.oid = con.conrelid
-           and nsp.oid = con.connamespace
-           and con.contype = 'x'
-           and nsp.nspname = $1
-           and rel.relname = $2;
-    ";
-
-    sql_query(query)
-        .bind::<Text, _>(namespace)
-        .bind::<Text, _>(table.as_str())
-        .get_result::<Row>(conn)
-        .map_err(StoreError::from)
-        .map(|row| row.uses_excl)
 }
 
 pub fn current_servers(conn: &PgConnection) -> Result<Vec<String>, StoreError> {
@@ -288,7 +349,7 @@ pub fn has_namespace(conn: &PgConnection, namespace: &Namespace) -> Result<bool,
     use pg_namespace as nsp;
 
     Ok(select(diesel::dsl::exists(
-        nsp::table.filter(nsp::nspname.eq(namespace.as_str())),
+        nsp::table.filter(nsp::name.eq(namespace.as_str())),
     ))
     .get_result::<bool>(conn)?)
 }
@@ -323,10 +384,16 @@ pub fn recreate_schema(conn: &PgConnection, nsp: &str) -> Result<(), StoreError>
     Ok(conn.batch_execute(&query)?)
 }
 
+/// Drop the schema `nsp` and all its contents if it exists
+pub fn drop_schema(conn: &PgConnection, nsp: &str) -> Result<(), StoreError> {
+    let query = format!("drop schema if exists {nsp} cascade;", nsp = nsp);
+    Ok(conn.batch_execute(&query)?)
+}
+
 pub fn migration_count(conn: &PgConnection) -> Result<i64, StoreError> {
     use __diesel_schema_migrations as m;
 
-    if !table_exists(conn, NAMESPACE_PUBLIC, &*MIGRATIONS_TABLE)? {
+    if !table_exists(conn, NAMESPACE_PUBLIC, &MIGRATIONS_TABLE)? {
         return Ok(0);
     }
 
@@ -340,7 +407,7 @@ pub fn account_like(conn: &PgConnection, site: &Site) -> Result<HashSet<String>,
         .select((ts::table_name, ts::is_account_like))
         .get_results::<(String, Option<bool>)>(conn)
         .optional()?
-        .unwrap_or(vec![])
+        .unwrap_or_default()
         .into_iter()
         .filter_map(|(name, account_like)| {
             if account_like == Some(true) {
@@ -374,22 +441,39 @@ pub fn set_account_like(
 }
 
 pub fn copy_account_like(conn: &PgConnection, src: &Site, dst: &Site) -> Result<usize, StoreError> {
-    let src_nsp = if src.shard == dst.shard {
-        "subgraphs".to_string()
-    } else {
-        ForeignServer::metadata_schema(&src.shard)
-    };
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
     let query = format!(
-        "insert into subgraphs.table_stats(deployment, table_name, is_account_like)
-         select $2 as deployment, ts.table_name, ts.is_account_like
+        "insert into subgraphs.table_stats(deployment, table_name, is_account_like, last_pruned_block)
+         select $2 as deployment, ts.table_name, ts.is_account_like, ts.last_pruned_block
            from {src_nsp}.table_stats ts
           where ts.deployment = $1",
         src_nsp = src_nsp
     );
-    Ok(sql_query(&query)
+    Ok(sql_query(query)
         .bind::<Integer, _>(src.id)
         .bind::<Integer, _>(dst.id)
         .execute(conn)?)
+}
+
+pub fn set_last_pruned_block(
+    conn: &PgConnection,
+    site: &Site,
+    table_name: &SqlName,
+    last_pruned_block: BlockNumber,
+) -> Result<(), StoreError> {
+    use table_stats as ts;
+
+    insert_into(ts::table)
+        .values((
+            ts::deployment.eq(site.id),
+            ts::table_name.eq(table_name.as_str()),
+            ts::last_pruned_block.eq(last_pruned_block),
+        ))
+        .on_conflict((ts::deployment, ts::table_name))
+        .do_update()
+        .set(ts::last_pruned_block.eq(last_pruned_block))
+        .execute(conn)?;
+    Ok(())
 }
 
 pub(crate) mod table_schema {
@@ -576,7 +660,7 @@ pub(crate) fn drop_index(
     index_name: &str,
 ) -> Result<(), StoreError> {
     let query = format!("drop index concurrently {schema_name}.{index_name}");
-    sql_query(&query)
+    sql_query(query)
         .bind::<Text, _>(schema_name)
         .bind::<Text, _>(index_name)
         .execute(conn)
@@ -584,7 +668,7 @@ pub(crate) fn drop_index(
     Ok(())
 }
 
-pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionStats>, StoreError> {
+pub fn stats(conn: &PgConnection, site: &Site) -> Result<Vec<VersionStats>, StoreError> {
     #[derive(Queryable, QueryableByName)]
     pub struct DbStats {
         #[sql_type = "Integer"]
@@ -596,6 +680,8 @@ pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionSt
         /// The ratio `entities / versions`
         #[sql_type = "Double"]
         pub ratio: f64,
+        #[sql_type = "Nullable<Integer>"]
+        pub last_pruned_block: Option<i32>,
     }
 
     impl From<DbStats> for VersionStats {
@@ -605,6 +691,7 @@ pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionSt
                 versions: s.versions,
                 tablename: s.tablename,
                 ratio: s.ratio,
+                last_pruned_block: s.last_pruned_block,
             }
         }
     }
@@ -614,8 +701,7 @@ pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionSt
     // values there are in the `id` column) See the [Postgres
     // docs](https://www.postgresql.org/docs/current/view-pg-stats.html) for
     // the precise meaning of n_distinct
-    let query = format!(
-        "select case when s.n_distinct < 0 then (- s.n_distinct * c.reltuples)::int4
+    let query = "select case when s.n_distinct < 0 then (- s.n_distinct * c.reltuples)::int4
                      else s.n_distinct::int4
                  end as entities,
                  c.reltuples::int4  as versions,
@@ -623,18 +709,23 @@ pub fn stats(conn: &PgConnection, namespace: &Namespace) -> Result<Vec<VersionSt
                 case when c.reltuples = 0 then 0::float8
                      when s.n_distinct < 0 then (-s.n_distinct)::float8
                      else greatest(s.n_distinct, 1)::float8 / c.reltuples::float8
-                 end as ratio
+                 end as ratio,
+                 ts.last_pruned_block
            from pg_namespace n, pg_class c, pg_stats s
-          where n.nspname = $1
+                left outer join subgraphs.table_stats ts
+                     on (ts.table_name = s.tablename
+                     and ts.deployment = $1)
+          where n.nspname = $2
             and c.relnamespace = n.oid
             and s.schemaname = n.nspname
             and s.attname = 'id'
             and c.relname = s.tablename
           order by c.relname"
-    );
+        .to_string();
 
     let stats = sql_query(query)
-        .bind::<Text, _>(namespace.as_str())
+        .bind::<Integer, _>(site.id)
+        .bind::<Text, _>(site.namespace.as_str())
         .load::<DbStats>(conn)
         .map_err(StoreError::from)?;
 
@@ -663,4 +754,108 @@ pub(crate) fn replication_lag(conn: &PgConnection) -> Result<Duration, StoreErro
         .unwrap_or(0);
 
     Ok(Duration::from_millis(lag))
+}
+
+pub(crate) fn cancel_vacuum(conn: &PgConnection, namespace: &Namespace) -> Result<(), StoreError> {
+    sql_query(
+        "select pg_cancel_backend(v.pid) \
+           from pg_stat_progress_vacuum v, \
+                pg_class c, \
+                pg_namespace n \
+          where v.relid = c.oid \
+            and c.relnamespace = n.oid \
+            and n.nspname = $1",
+    )
+    .bind::<Text, _>(namespace)
+    .execute(conn)?;
+    Ok(())
+}
+
+pub(crate) fn default_stats_target(conn: &PgConnection) -> Result<i32, StoreError> {
+    #[derive(Queryable, QueryableByName)]
+    struct Target {
+        #[sql_type = "Integer"]
+        setting: i32,
+    }
+
+    let target =
+        sql_query("select setting::int from pg_settings where name = 'default_statistics_target'")
+            .get_result::<Target>(conn)?;
+    Ok(target.setting)
+}
+
+pub(crate) fn stats_targets(
+    conn: &PgConnection,
+    namespace: &Namespace,
+) -> Result<BTreeMap<SqlName, BTreeMap<SqlName, i32>>, StoreError> {
+    use pg_attribute as a;
+    use pg_class as c;
+    use pg_namespace as n;
+
+    let targets = c::table
+        .inner_join(n::table)
+        .inner_join(a::table)
+        .filter(c::kind.eq("r"))
+        .filter(n::name.eq(namespace.as_str()))
+        .filter(a::num.ge(1))
+        .select((c::name, a::name, a::stats_target))
+        .load::<(String, String, i32)>(conn)?
+        .into_iter()
+        .map(|(table, column, target)| (SqlName::from(table), SqlName::from(column), target));
+
+    let map = targets.into_iter().fold(
+        BTreeMap::<SqlName, BTreeMap<SqlName, i32>>::new(),
+        |mut map, (table, column, target)| {
+            map.entry(table).or_default().insert(column, target);
+            map
+        },
+    );
+    Ok(map)
+}
+
+pub(crate) fn set_stats_target(
+    conn: &PgConnection,
+    namespace: &Namespace,
+    table: &SqlName,
+    columns: &[&SqlName],
+    target: i32,
+) -> Result<(), StoreError> {
+    let columns = columns
+        .iter()
+        .map(|column| format!("alter column {} set statistics {}", column.quoted(), target))
+        .join(", ");
+    let query = format!("alter table {}.{} {}", namespace, table.quoted(), columns);
+    conn.batch_execute(&query)?;
+    Ok(())
+}
+
+/// Return the names of all tables in the `namespace` that need to be
+/// analyzed. Whether a table needs to be analyzed is determined with the
+/// same logic that Postgres' [autovacuum
+/// daemon](https://www.postgresql.org/docs/current/routine-vacuuming.html#AUTOVACUUM)
+/// uses
+pub(crate) fn needs_autoanalyze(
+    conn: &PgConnection,
+    namespace: &Namespace,
+) -> Result<Vec<SqlName>, StoreError> {
+    const QUERY: &str = "select relname \
+                           from pg_stat_user_tables \
+                          where (select setting::numeric from pg_settings where name = 'autovacuum_analyze_threshold') \
+                              + (select setting::numeric from pg_settings where name = 'autovacuum_analyze_scale_factor')*(n_live_tup + n_dead_tup) < n_mod_since_analyze
+                            and schemaname = $1";
+
+    #[derive(Queryable, QueryableByName)]
+    struct TableName {
+        #[sql_type = "Text"]
+        name: SqlName,
+    }
+
+    let tables = sql_query(QUERY)
+        .bind::<Text, _>(namespace.as_str())
+        .get_results::<TableName>(conn)
+        .optional()?
+        .map(|tables| tables.into_iter().map(|t| t.name).collect())
+        .unwrap_or(vec![]);
+
+    Ok(tables)
 }

@@ -2,6 +2,7 @@ use anyhow::{anyhow, Error};
 use anyhow::{ensure, Context};
 use graph::blockchain::TriggerWithHandler;
 use graph::components::store::StoredDynamicDataSource;
+use graph::data_source::CausalityRegion;
 use graph::prelude::ethabi::ethereum_types::H160;
 use graph::prelude::ethabi::StateMutability;
 use graph::prelude::futures03::future::try_join;
@@ -9,7 +10,7 @@ use graph::prelude::futures03::stream::FuturesOrdered;
 use graph::prelude::{Link, SubgraphManifestValidationError};
 use graph::slog::{o, trace};
 use std::str::FromStr;
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 use tiny_keccak::{keccak256, Keccak};
 
 use graph::{
@@ -17,7 +18,7 @@ use graph::{
     prelude::{
         async_trait,
         ethabi::{Address, Contract, Event, Function, LogParam, ParamType, RawLog},
-        info, serde_json, warn,
+        serde_json, warn,
         web3::types::{Log, Transaction, H256},
         BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, EthereumCall,
         LightEthereumBlock, LightEthereumBlockExt, LinkResolver, Logger, TryStreamExt,
@@ -50,6 +51,54 @@ pub struct DataSource {
 }
 
 impl blockchain::DataSource<Chain> for DataSource {
+    fn from_template_info(info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
+        let DataSourceTemplateInfo {
+            template,
+            params,
+            context,
+            creation_block,
+        } = info;
+        let template = template.into_onchain().ok_or(anyhow!(
+            "Cannot create onchain data source from offchain template"
+        ))?;
+
+        // Obtain the address from the parameters
+        let string = params
+            .get(0)
+            .with_context(|| {
+                format!(
+                    "Failed to create data source from template `{}`: address parameter is missing",
+                    template.name
+                )
+            })?
+            .trim_start_matches("0x");
+
+        let address = Address::from_str(string).with_context(|| {
+            format!(
+                "Failed to create data source from template `{}`, invalid address provided",
+                template.name
+            )
+        })?;
+
+        let contract_abi = template
+            .mapping
+            .find_abi(&template.source.abi)
+            .with_context(|| format!("template `{}`", template.name))?;
+
+        Ok(DataSource {
+            kind: template.kind,
+            network: template.network,
+            name: template.name,
+            manifest_idx: template.manifest_idx,
+            address: Some(address),
+            start_block: 0,
+            mapping: template.mapping,
+            context: Arc::new(context),
+            creation_block: Some(creation_block),
+            contract_abi,
+        })
+    }
+
     fn address(&self) -> Option<&[u8]> {
         self.address.as_ref().map(|x| x.as_bytes())
     }
@@ -77,7 +126,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn network(&self) -> Option<&str> {
-        self.network.as_ref().map(|s| s.as_str())
+        self.network.as_deref()
     }
 
     fn context(&self) -> Arc<Option<DataSourceContext>> {
@@ -129,9 +178,10 @@ impl blockchain::DataSource<Chain> for DataSource {
                 .context
                 .as_ref()
                 .as_ref()
-                .map(|ctx| serde_json::to_value(&ctx).unwrap()),
+                .map(|ctx| serde_json::to_value(ctx).unwrap()),
             creation_block: self.creation_block,
-            is_offchain: false,
+            done_at: None,
+            causality_region: CausalityRegion::ONCHAIN,
         }
     }
 
@@ -144,13 +194,16 @@ impl blockchain::DataSource<Chain> for DataSource {
             param,
             context,
             creation_block,
-            is_offchain,
+            done_at,
+            causality_region,
         } = stored;
 
         ensure!(
-            !is_offchain,
-            "attempted to convert offchain data source to ethereum data source"
+            causality_region == CausalityRegion::ONCHAIN,
+            "stored ethereum data source has causality region {}, expected root",
+            causality_region
         );
+        ensure!(done_at.is_none(), "onchain data sources are never done");
 
         let context = context.map(serde_json::from_value).transpose()?;
 
@@ -311,7 +364,7 @@ impl DataSource {
                 .mapping
                 .block_handlers
                 .iter()
-                .find(move |handler| handler.filter == None)
+                .find(move |handler| handler.filter.is_none())
                 .cloned(),
             EthereumBlockTriggerType::WithCallTo(_address) => self
                 .mapping
@@ -336,7 +389,7 @@ impl DataSource {
                 event
                     .inputs
                     .iter()
-                    .map(|input| format!("{}", event_param_type_signature(&input.kind)))
+                    .map(|input| event_param_type_signature(&input.kind))
                     .collect::<Vec<_>>()
                     .join(",")
             )
@@ -371,16 +424,16 @@ impl DataSource {
                 Uint(size) => format!("uint{}", size),
                 Bool => "bool".into(),
                 String => "string".into(),
-                Array(inner) => format!("{}[]", event_param_type_signature(&*inner)),
+                Array(inner) => format!("{}[]", event_param_type_signature(inner)),
                 FixedBytes(size) => format!("bytes{}", size),
                 FixedArray(inner, size) => {
-                    format!("{}[{}]", event_param_type_signature(&*inner), size)
+                    format!("{}[{}]", event_param_type_signature(inner), size)
                 }
                 Tuple(components) => format!(
                     "({})",
                     components
                         .iter()
-                        .map(|component| event_param_type_signature(&component))
+                        .map(event_param_type_signature)
                         .collect::<Vec<_>>()
                         .join(",")
                 ),
@@ -443,7 +496,7 @@ impl DataSource {
                     .collect::<Vec<String>>()
                     .join(",");
                 // `address,uint256,bool)
-                arguments.push_str(")");
+                arguments.push(')');
                 // `operation(address,uint256,bool)`
                 let actual_signature = vec![function.name.clone(), arguments].join("(");
                 target_signature == actual_signature
@@ -478,7 +531,7 @@ impl DataSource {
         block: &Arc<LightEthereumBlock>,
         logger: &Logger,
     ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
-        if !self.matches_trigger_address(&trigger) {
+        if !self.matches_trigger_address(trigger) {
             return Ok(None);
         }
 
@@ -576,7 +629,7 @@ impl DataSource {
                 // See also ca0edc58-0ec5-4c89-a7dd-2241797f5e50.
                 let transaction = if log.transaction_hash != block.hash {
                     block
-                        .transaction_for_log(&log)
+                        .transaction_for_log(log)
                         .context("Found no transaction for event")?
                 } else {
                     // Infer some fields from the log and fill the rest with zeros.
@@ -610,7 +663,7 @@ impl DataSource {
             }
             EthereumTrigger::Call(call) => {
                 // Identify the call handler for this call
-                let handler = match self.handler_for_call(&call)? {
+                let handler = match self.handler_for_call(call)? {
                     Some(handler) => handler,
                     None => return Ok(None),
                 };
@@ -697,7 +750,7 @@ impl DataSource {
 
                 let transaction = Arc::new(
                     block
-                        .transaction_for_call(&call)
+                        .transaction_for_call(call)
                         .context("Found no transaction for call")?,
                 );
                 let logging_extras = Arc::new(o! {
@@ -749,63 +802,14 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source_address" => format_args!("{:?}", source.address), "source_start_block" => source.start_block);
-
-        let mapping = mapping.resolve(&*resolver, logger).await?;
-
-        DataSource::from_manifest(kind, network, name, source, mapping, context, manifest_idx)
-    }
-}
-
-impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
-    type Error = anyhow::Error;
-
-    fn try_from(info: DataSourceTemplateInfo<Chain>) -> Result<Self, anyhow::Error> {
-        let DataSourceTemplateInfo {
-            template,
-            params,
-            context,
-            creation_block,
-        } = info;
-        let template = template.into_onchain().ok_or(anyhow!(
-            "Cannot create onchain data source from offchain template"
-        ))?;
-
-        // Obtain the address from the parameters
-        let string = params
-            .get(0)
-            .with_context(|| {
-                format!(
-                    "Failed to create data source from template `{}`: address parameter is missing",
-                    template.name
-                )
-            })?
-            .trim_start_matches("0x");
-
-        let address = Address::from_str(string).with_context(|| {
+        let mapping = mapping.resolve(resolver, logger).await.with_context(|| {
             format!(
-                "Failed to create data source from template `{}`, invalid address provided",
-                template.name
+                "failed to resolve data source {} with source_address {:?} and source_start_block {}",
+                name, source.address, source.start_block
             )
         })?;
 
-        let contract_abi = template
-            .mapping
-            .find_abi(&template.source.abi)
-            .with_context(|| format!("template `{}`", template.name))?;
-
-        Ok(DataSource {
-            kind: template.kind,
-            network: template.network,
-            name: template.name,
-            manifest_idx: template.manifest_idx,
-            address: Some(address),
-            start_block: 0,
-            mapping: template.mapping,
-            context: Arc::new(context),
-            creation_block: Some(creation_block),
-            contract_abi,
-        })
+        DataSource::from_manifest(kind, network, name, source, mapping, context, manifest_idx)
     }
 }
 
@@ -844,7 +848,10 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
             mapping,
         } = self;
 
-        info!(logger, "Resolve data source template"; "name" => &name);
+        let mapping = mapping
+            .resolve(resolver, logger)
+            .await
+            .with_context(|| format!("failed to resolve data source template {}", name))?;
 
         Ok(DataSourceTemplate {
             kind,
@@ -852,7 +859,7 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
             name,
             manifest_idx,
             source,
-            mapping: mapping.resolve(resolver, logger).await?,
+            mapping,
         })
     }
 }
@@ -949,8 +956,6 @@ impl UnresolvedMapping {
             file: link,
         } = self;
 
-        info!(logger, "Resolve mapping"; "link" => &link.link);
-
         let api_version = semver::Version::parse(&api_version)?;
 
         let (abis, runtime) = try_join(
@@ -968,7 +973,8 @@ impl UnresolvedMapping {
                 Ok(Arc::new(module_bytes))
             },
         )
-        .await?;
+        .await
+        .with_context(|| format!("failed to resolve mapping {}", link.link))?;
 
         Ok(Mapping {
             kind,
@@ -1003,14 +1009,12 @@ impl UnresolvedMappingABI {
         resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
     ) -> Result<MappingABI, anyhow::Error> {
-        info!(
-            logger,
-            "Resolve ABI";
-            "name" => &self.name,
-            "link" => &self.file.link
-        );
-
-        let contract_bytes = resolver.cat(&logger, &self.file).await?;
+        let contract_bytes = resolver.cat(logger, &self.file).await.with_context(|| {
+            format!(
+                "failed to resolve ABI {} from {}",
+                self.name, self.file.link
+            )
+        })?;
         let contract = Contract::load(&*contract_bytes)?;
         Ok(MappingABI {
             name: self.name,
@@ -1058,7 +1062,7 @@ impl MappingEventHandler {
 /// Hashes a string to a H256 hash.
 fn string_to_h256(s: &str) -> H256 {
     let mut result = [0u8; 32];
-    let data = s.replace(" ", "").into_bytes();
+    let data = s.replace(' ', "").into_bytes();
     let mut sponge = Keccak::new_keccak256();
     sponge.update(&data);
     sponge.finalize(&mut result);

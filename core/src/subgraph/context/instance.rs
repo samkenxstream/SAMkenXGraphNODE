@@ -1,14 +1,17 @@
 use futures01::sync::mpsc::Sender;
 use graph::{
     blockchain::Blockchain,
-    data_source::{DataSource, DataSourceTemplate},
+    data_source::{
+        causality_region::CausalityRegionSeq, offchain, CausalityRegion, DataSource,
+        DataSourceTemplate,
+    },
     prelude::*,
 };
 use std::collections::HashMap;
 
 use super::OffchainMonitor;
 
-pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
+pub struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
     subgraph_id: DeploymentHash,
     network: String,
     host_builder: T,
@@ -24,6 +27,9 @@ pub(crate) struct SubgraphInstance<C: Blockchain, T: RuntimeHostBuilder<C>> {
 
     /// Maps the hash of a module to a channel to the thread in which the module is instantiated.
     module_cache: HashMap<[u8; 32], Sender<T::Req>>,
+
+    /// This manages the sequence of causality regions for the subgraph.
+    causality_region_seq: CausalityRegionSeq,
 }
 
 impl<T, C> SubgraphInstance<C, T>
@@ -37,6 +43,7 @@ where
         host_builder: T,
         host_metrics: Arc<HostMetrics>,
         offchain_monitor: &mut OffchainMonitor,
+        causality_region_seq: CausalityRegionSeq,
     ) -> Result<Self, Error> {
         let subgraph_id = manifest.id.clone();
         let network = manifest.network_name();
@@ -50,6 +57,7 @@ where
             module_cache: HashMap::new(),
             templates,
             host_metrics,
+            causality_region_seq,
         };
 
         // Create a new runtime host for each data source in the subgraph manifest;
@@ -67,7 +75,10 @@ where
             };
 
             if let DataSource::Offchain(ds) = &ds {
-                offchain_monitor.add_source(ds.source.clone())?;
+                // monitor data source only if it's not processed.
+                if !ds.is_processed() {
+                    offchain_monitor.add_source(ds.source.clone())?;
+                }
             }
 
             let host = this.new_host(logger.cheap_clone(), ds, module_bytes)?;
@@ -116,13 +127,11 @@ where
         data_source: DataSource<C>,
     ) -> Result<Option<Arc<T::Host>>, Error> {
         // Protect against creating more than the allowed maximum number of data sources
-        if let Some(max_data_sources) = ENV_VARS.subgraph_max_data_sources {
-            if self.hosts.len() >= max_data_sources {
-                anyhow::bail!(
-                    "Limit of {} data sources per subgraph exceeded",
-                    max_data_sources,
-                );
-            }
+        if self.hosts.len() >= ENV_VARS.subgraph_max_data_sources {
+            anyhow::bail!(
+                "Limit of {} data sources per subgraph exceeded",
+                ENV_VARS.subgraph_max_data_sources,
+            );
         }
 
         // `hosts` will remain ordered by the creation block.
@@ -147,7 +156,42 @@ where
         })
     }
 
-    pub(super) fn revert_data_sources(&mut self, reverted_block: BlockNumber) {
+    /// Reverts any DataSources that have been added from the block forwards (inclusively)
+    /// This function also reverts the done_at status if it was 'done' on this block or later.
+    /// It only returns the offchain::Source because we don't currently need to know which
+    /// DataSources were removed, the source is used so that the offchain DDS can be found again.
+    pub(super) fn revert_data_sources(
+        &mut self,
+        reverted_block: BlockNumber,
+    ) -> Vec<offchain::Source> {
+        self.revert_hosts_cheap(reverted_block);
+
+        // The following code handles resetting offchain datasources so in most
+        // cases this is enough processing.
+        // At some point we prolly need to improve the linear search but for now this
+        // should be fine. *IT'S FINE*
+        //
+        // Any File DataSources (Dynamic Data Sources), will have their own causality region
+        // which currently is the next number of the sequence but that should be an internal detail.
+        // Regardless of the sequence logic, if the current causality region is ONCHAIN then there are
+        // no others and therefore the remaining code is a noop and we can just stop here.
+        if self.causality_region_seq.0 == CausalityRegion::ONCHAIN {
+            return vec![];
+        }
+
+        self.hosts
+            .iter()
+            .filter(|host| matches!(host.done_at(), Some(done_at) if done_at >= reverted_block))
+            .map(|host| {
+                host.set_done_at(None);
+                // Safe to call unwrap() because only offchain DataSources have done_at = Some
+                host.data_source().as_offchain().unwrap().source.clone()
+            })
+            .collect()
+    }
+
+    /// Because hosts are ordered, removing them based on creation block is cheap and simple.
+    fn revert_hosts_cheap(&mut self, reverted_block: BlockNumber) {
         // `hosts` is ordered by the creation block.
         // See also 8f1bca33-d3b7-4035-affc-fd6161a12448.
         while self
@@ -160,7 +204,11 @@ where
         }
     }
 
-    pub(super) fn hosts(&self) -> &[Arc<T::Host>] {
+    pub fn hosts(&self) -> &[Arc<T::Host>] {
         &self.hosts
+    }
+
+    pub(super) fn causality_region_next_value(&mut self) -> CausalityRegion {
+        self.causality_region_seq.next_val()
     }
 }

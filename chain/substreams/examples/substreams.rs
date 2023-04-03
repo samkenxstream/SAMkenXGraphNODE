@@ -1,16 +1,12 @@
 use anyhow::{format_err, Context, Error};
 use graph::blockchain::block_stream::BlockStreamEvent;
 use graph::blockchain::substreams_block_stream::SubstreamsBlockStream;
-use graph::prelude::{info, tokio, DeploymentHash, Registry};
+use graph::endpoint::EndpointMetrics;
+use graph::firehose::SubgraphLimit;
+use graph::prelude::{info, tokio, DeploymentHash, MetricsRegistry, Registry};
 use graph::tokio_stream::StreamExt;
-use graph::{
-    env::env_var,
-    firehose::FirehoseEndpoint,
-    log::logger,
-    substreams::{self},
-};
+use graph::{env::env_var, firehose::FirehoseEndpoint, log::logger, substreams};
 use graph_chain_substreams::mapper::Mapper;
-use graph_core::MetricsRegistry;
 use prost::Message;
 use std::env;
 use std::sync::Arc;
@@ -21,17 +17,17 @@ async fn main() -> Result<(), Error> {
 
     let token_env = env_var("SUBSTREAMS_API_TOKEN", "".to_string());
     let mut token: Option<String> = None;
-    if token_env.len() > 0 {
+    if !token_env.is_empty() {
         token = Some(token_env);
     }
 
     let endpoint = env_var(
         "SUBSTREAMS_ENDPOINT",
-        "https://api-dev.streamingfast.io".to_string(),
+        "https://api.streamingfast.io".to_string(),
     );
 
     let package_file = env_var("SUBSTREAMS_PACKAGE", "".to_string());
-    if package_file == "" {
+    if package_file.is_empty() {
         panic!("Environment variable SUBSTREAMS_PACKAGE must be set");
     }
 
@@ -45,13 +41,20 @@ async fn main() -> Result<(), Error> {
         prometheus_registry.clone(),
     ));
 
+    let endpoint_metrics = EndpointMetrics::new(
+        logger.clone(),
+        &[endpoint.clone()],
+        Arc::new(MetricsRegistry::mock()),
+    );
+
     let firehose = Arc::new(FirehoseEndpoint::new(
         "substreams",
         &endpoint,
         token,
         false,
         false,
-        1,
+        SubgraphLimit::Unlimited,
+        Arc::new(endpoint_metrics),
     ));
 
     let mut stream: SubstreamsBlockStream<graph_chain_substreams::Chain> =
@@ -79,17 +82,9 @@ async fn main() -> Result<(), Error> {
                 Ok(block_stream_event) => match block_stream_event {
                     BlockStreamEvent::Revert(_, _) => {}
                     BlockStreamEvent::ProcessBlock(block_with_trigger, _) => {
-                        let changes = block_with_trigger.block;
-                        for change in changes.entity_changes {
-                            info!(&logger, "----- Entity -----");
-                            info!(
-                                &logger,
-                                "name: {} operation: {}", change.entity, change.operation
-                            );
+                        for change in block_with_trigger.block.changes.entity_changes {
                             for field in change.fields {
-                                info!(&logger, "field: {}, type: {}", field.name, field.value_type);
-                                info!(&logger, "new value: {}", hex::encode(field.new_value));
-                                info!(&logger, "old value: {}", hex::encode(field.old_value));
+                                info!(&logger, "field: {:?}", field);
                             }
                         }
                     }

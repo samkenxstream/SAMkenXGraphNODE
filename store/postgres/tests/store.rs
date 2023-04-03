@@ -3,7 +3,6 @@ use graph::data::graphql::ext::TypeDefinitionExt;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::DeploymentCreate;
 use graph_chain_ethereum::{Mapping, MappingABI};
-use graph_mock::MockMetricsRegistry;
 use hex_literal::hex;
 use lazy_static::lazy_static;
 use std::time::Duration;
@@ -189,7 +188,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Johnton",
         "tonofjohn@email.com",
-        67 as i32,
+        67_i32,
         184.4,
         false,
         None,
@@ -208,7 +207,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Cindini",
         "dinici@email.com",
-        43 as i32,
+        43_i32,
         159.1,
         true,
         Some("red"),
@@ -218,7 +217,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Shaqueeena",
         "queensha@email.com",
-        28 as i32,
+        28_i32,
         111.7,
         false,
         Some("blue"),
@@ -237,7 +236,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Shaqueeena",
         "teeko@email.com",
-        28 as i32,
+        28_i32,
         111.7,
         false,
         None,
@@ -315,7 +314,7 @@ fn delete_entity() {
         // Check that there is an entity to remove.
         writable.get(&entity_key).unwrap().unwrap();
 
-        let count = get_entity_count(store.clone(), &&deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash);
         transact_and_wait(
             &store.subgraph_store(),
             &deployment,
@@ -326,10 +325,7 @@ fn delete_entity() {
         )
         .await
         .unwrap();
-        assert_eq!(
-            count,
-            get_entity_count(store.clone(), &&deployment.hash) + 1
-        );
+        assert_eq!(count, get_entity_count(store.clone(), &deployment.hash) + 1);
 
         // Check that that the deleted entity id is not present
         assert!(writable.get(&entity_key).unwrap().is_none());
@@ -352,7 +348,7 @@ fn get_entity_1() {
             Value::Bytes("Johnton".as_bytes().into()),
         );
         expected_entity.insert("email".to_owned(), "tonofjohn@email.com".into());
-        expected_entity.insert("age".to_owned(), Value::Int(67 as i32));
+        expected_entity.insert("age".to_owned(), Value::Int(67_i32));
         expected_entity.insert(
             "seconds_age".to_owned(),
             Value::BigInt(BigInt::from(2114359200)),
@@ -382,7 +378,7 @@ fn get_entity_3() {
             Value::Bytes("Shaqueeena".as_bytes().into()),
         );
         expected_entity.insert("email".to_owned(), "teeko@email.com".into());
-        expected_entity.insert("age".to_owned(), Value::Int(28 as i32));
+        expected_entity.insert("age".to_owned(), Value::Int(28_i32));
         expected_entity.insert(
             "seconds_age".to_owned(),
             Value::BigInt(BigInt::from(883612800)),
@@ -405,12 +401,12 @@ fn insert_entity() {
             USER,
             "Wanjon",
             "wanawana@email.com",
-            76 as i32,
+            76_i32,
             111.7,
             true,
             Some("green"),
         );
-        let count = get_entity_count(store.clone(), &&deployment.hash);
+        let count = get_entity_count(store.clone(), &deployment.hash);
         transact_and_wait(
             &store.subgraph_store(),
             &deployment,
@@ -436,7 +432,7 @@ fn update_existing() {
             USER,
             "Wanjon",
             "wanawana@email.com",
-            76 as i32,
+            76_i32,
             111.7,
             true,
             Some("green"),
@@ -542,7 +538,7 @@ impl QueryChecker {
         let entity_ids: Vec<_> = entities
             .into_iter()
             .map(|entity| match entity.get("id") {
-                Some(Value::String(id)) => id.to_owned(),
+                Some(Value::String(id)) => id.clone(),
                 Some(_) => panic!("store.find returned entity with non-string ID attribute"),
                 None => panic!("store.find returned entity with no ID attribute"),
             })
@@ -743,20 +739,20 @@ fn find() {
             .check(
                 vec!["1"],
                 user_query()
-                    .filter(EntityFilter::Equal("age".to_owned(), Value::Int(67 as i32)))
+                    .filter(EntityFilter::Equal("age".to_owned(), Value::Int(67_i32)))
                     .desc("name"),
             )
             .check(
                 vec!["3", "2"],
                 user_query()
-                    .filter(EntityFilter::Not("age".to_owned(), Value::Int(67 as i32)))
+                    .filter(EntityFilter::Not("age".to_owned(), Value::Int(67_i32)))
                     .desc("name"),
             )
             .check(
                 vec!["1"],
                 user_query().filter(EntityFilter::GreaterThan(
                     "age".to_owned(),
-                    Value::Int(43 as i32),
+                    Value::Int(43_i32),
                 )),
             )
             .check(
@@ -764,17 +760,14 @@ fn find() {
                 user_query()
                     .filter(EntityFilter::GreaterOrEqual(
                         "age".to_owned(),
-                        Value::Int(43 as i32),
+                        Value::Int(43_i32),
                     ))
                     .asc("name"),
             )
             .check(
                 vec!["2", "3"],
                 user_query()
-                    .filter(EntityFilter::LessThan(
-                        "age".to_owned(),
-                        Value::Int(50 as i32),
-                    ))
+                    .filter(EntityFilter::LessThan("age".to_owned(), Value::Int(50_i32)))
                     .asc("name"),
             )
             .check(
@@ -782,26 +775,20 @@ fn find() {
                 user_query()
                     .filter(EntityFilter::LessOrEqual(
                         "age".to_owned(),
-                        Value::Int(43 as i32),
+                        Value::Int(43_i32),
                     ))
                     .asc("name"),
             )
             .check(
                 vec!["3", "2"],
                 user_query()
-                    .filter(EntityFilter::LessThan(
-                        "age".to_owned(),
-                        Value::Int(50 as i32),
-                    ))
+                    .filter(EntityFilter::LessThan("age".to_owned(), Value::Int(50_i32)))
                     .desc("name"),
             )
             .check(
                 vec!["2"],
                 user_query()
-                    .filter(EntityFilter::LessThan(
-                        "age".to_owned(),
-                        Value::Int(67 as i32),
-                    ))
+                    .filter(EntityFilter::LessThan("age".to_owned(), Value::Int(67_i32)))
                     .desc("name")
                     .first(1)
                     .skip(1),
@@ -811,7 +798,7 @@ fn find() {
                 user_query()
                     .filter(EntityFilter::In(
                         "age".to_owned(),
-                        vec![Value::Int(67 as i32), Value::Int(43 as i32)],
+                        vec![Value::Int(67_i32), Value::Int(43_i32)],
                     ))
                     .desc("name")
                     .first(5),
@@ -821,7 +808,7 @@ fn find() {
                 user_query()
                     .filter(EntityFilter::NotIn(
                         "age".to_owned(),
-                        vec![Value::Int(67 as i32), Value::Int(43 as i32)],
+                        vec![Value::Int(67_i32), Value::Int(43_i32)],
                     ))
                     .desc("name")
                     .first(5),
@@ -938,14 +925,12 @@ async fn check_events(
 ) {
     fn as_set(events: Vec<Arc<StoreEvent>>) -> HashSet<EntityChange> {
         events.into_iter().fold(HashSet::new(), |mut set, event| {
-            set.extend(event.changes.iter().map(|change| change.clone()));
+            set.extend(event.changes.iter().cloned());
             set
         })
     }
 
-    let expected = Mutex::new(as_set(
-        expected.into_iter().map(|event| Arc::new(event)).collect(),
-    ));
+    let expected = Mutex::new(as_set(expected.into_iter().map(Arc::new).collect()));
     // Capture extra changes here; this is only needed for debugging, really.
     // It's permissible that we get more changes than we expected because of
     // how store events group changes together
@@ -956,7 +941,7 @@ async fn check_events(
         .take_while(|event| {
             let mut expected = expected.lock().unwrap();
             for change in &event.changes {
-                if !expected.remove(&change) {
+                if !expected.remove(change) {
                     extra.lock().unwrap().insert(change.clone());
                 }
             }
@@ -966,11 +951,13 @@ async fn check_events(
         .compat()
         .timeout(Duration::from_secs(3))
         .await
-        .expect(&format!(
-            "timed out waiting for events\n  still waiting for {:?}\n  got extra events {:?}",
-            expected.lock().unwrap().clone(),
-            extra.lock().unwrap().clone()
-        ))
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out waiting for events\n  still waiting for {:?}\n  got extra events {:?}",
+                expected.lock().unwrap().clone(),
+                extra.lock().unwrap().clone()
+            )
+        })
         .expect("something went wrong getting events");
     // Check again that we really got everything
     assert_eq!(HashSet::new(), expected.lock().unwrap().clone());
@@ -1008,7 +995,7 @@ async fn check_basic_revert(
     assert_eq!(&deployment.hash, &state.id);
 
     // Revert block 3
-    revert_block(&store, &deployment, &*TEST_BLOCK_1_PTR).await;
+    revert_block(&store, deployment, &TEST_BLOCK_1_PTR).await;
 
     let returned_entities = store
         .subgraph_store()
@@ -1019,7 +1006,7 @@ async fn check_basic_revert(
     assert_eq!(1, returned_entities.len());
 
     // Check if the first user in the result vector has email "queensha@email.com"
-    let returned_name = returned_entities[0].get(&"email".to_owned());
+    let returned_name = returned_entities[0].get("email");
     let test_value = Value::String("queensha@email.com".to_owned());
     assert!(returned_name.is_some());
     assert_eq!(&test_value, returned_name.unwrap());
@@ -1068,7 +1055,7 @@ fn revert_block_with_delete() {
 
         // Revert deletion
         let count = get_entity_count(store.clone(), &deployment.hash);
-        revert_block(&store, &deployment, &*TEST_BLOCK_2_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
         assert_eq!(count + 1, get_entity_count(store.clone(), &deployment.hash));
 
         // Query after revert
@@ -1081,7 +1068,7 @@ fn revert_block_with_delete() {
         assert_eq!(1, returned_entities.len());
 
         // Check if "dinici@email.com" is in result set
-        let returned_name = returned_entities[0].get(&"email".to_owned());
+        let returned_name = returned_entities[0].get("email");
         let test_value = Value::String("dinici@email.com".to_owned());
         assert!(returned_name.is_some());
         assert_eq!(&test_value, returned_name.unwrap());
@@ -1124,7 +1111,7 @@ fn revert_block_with_partial_update() {
 
         // Perform revert operation, reversing the partial update
         let count = get_entity_count(store.clone(), &deployment.hash);
-        revert_block(&store, &deployment, &*TEST_BLOCK_2_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
         assert_eq!(count, get_entity_count(store.clone(), &deployment.hash));
 
         // Obtain the reverted entity from the store
@@ -1247,7 +1234,7 @@ fn revert_block_with_dynamic_data_source_operations() {
         let subscription = subscribe(&deployment.hash, USER);
 
         // Revert block that added the user and the dynamic data source
-        revert_block(&store, &deployment, &*TEST_BLOCK_2_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
 
         // Verify that the user is the original again
         assert_eq!(
@@ -1338,8 +1325,8 @@ fn entity_changes_are_fired_and_forwarded_to_subscriptions() {
             added_entities
                 .iter()
                 .map(|(id, data)| EntityOperation::Set {
-                    key: EntityKey::data(USER.to_owned(), id.to_owned()),
-                    data: data.to_owned(),
+                    key: EntityKey::data(USER.to_owned(), id.clone()),
+                    data: data.clone(),
                 })
                 .collect(),
         )
@@ -1405,11 +1392,11 @@ fn throttle_subscription_delivers() {
     run_test(|store, _, deployment| async move {
         let subscription = subscribe(&deployment.hash, USER)
             .throttle_while_syncing(
-                &*LOGGER,
+                &LOGGER,
                 store
                     .clone()
                     .query_store(
-                        QueryTarget::Deployment(deployment.hash.clone().into(), Default::default()),
+                        QueryTarget::Deployment(deployment.hash.clone(), Default::default()),
                         true,
                     )
                     .await
@@ -1423,7 +1410,7 @@ fn throttle_subscription_delivers() {
             USER,
             "Steve",
             "nieve@email.com",
-            72 as i32,
+            72_i32,
             120.7,
             false,
             None,
@@ -1450,7 +1437,7 @@ fn throttle_subscription_throttles() {
         // Throttle for a very long time (30s)
         let subscription = subscribe(&deployment.hash, USER)
             .throttle_while_syncing(
-                &*LOGGER,
+                &LOGGER,
                 store
                     .clone()
                     .query_store(
@@ -1468,7 +1455,7 @@ fn throttle_subscription_throttles() {
             USER,
             "Steve",
             "nieve@email.com",
-            72 as i32,
+            72_i32,
             120.7,
             false,
             None,
@@ -1555,12 +1542,10 @@ fn handle_large_string_with_index() {
         // the repeated text compresses so well. This leads to an error
         // 'index row requires 11488 bytes, maximum size is 8191' if
         // used with a btree index without size limitation
-        let long_text = std::iter::repeat("Quo usque tandem")
-            .take(62500)
-            .collect::<String>();
+        let long_text = "Quo usque tandem".repeat(62500);
         let other_text = long_text.clone() + "X";
 
-        let metrics_registry = Arc::new(MockMetricsRegistry::new());
+        let metrics_registry = Arc::new(MetricsRegistry::mock());
         let stopwatch_metrics = StopwatchMetrics::new(
             Logger::root(slog::Discard, o!()),
             deployment.hash.clone(),
@@ -1648,10 +1633,7 @@ fn handle_large_bytea_with_index() {
         // repeated text compresses so well. This leads to an error 'index
         // row size 2784 exceeds btree version 4 maximum 2704' if used with
         // a btree index without size limitation
-        let long_bytea = std::iter::repeat("Quo usque tandem")
-            .take(15000)
-            .collect::<String>()
-            .into_bytes();
+        let long_bytea = "Quo usque tandem".repeat(15000).into_bytes();
         let other_bytea = {
             let mut other_bytea = long_bytea.clone();
             other_bytea.push(b'X');
@@ -1659,7 +1641,7 @@ fn handle_large_bytea_with_index() {
         };
         let long_bytea = scalar::Bytes::from(long_bytea.as_slice());
 
-        let metrics_registry = Arc::new(MockMetricsRegistry::new());
+        let metrics_registry = Arc::new(MetricsRegistry::mock());
         let stopwatch_metrics = StopwatchMetrics::new(
             Logger::root(slog::Discard, o!()),
             deployment.hash.clone(),
@@ -1821,7 +1803,7 @@ impl WindowQuery {
             .expect("store.find failed to execute query")
             .into_iter()
             .map(|entity| match entity.get("id") {
-                Some(Value::String(id)) => id.to_owned(),
+                Some(Value::String(id)) => id.clone(),
                 Some(_) => panic!("store.find returned entity with non-string ID attribute"),
                 None => panic!("store.find returned entity with no ID attribute"),
             })
@@ -2029,6 +2011,39 @@ fn parse_timestamp() {
 }
 
 #[test]
+fn parse_timestamp_firehose() {
+    const EXPECTED_TS: u64 = 1657712166;
+
+    run_test(|store, _, _| async move {
+        use block_store::*;
+        // The test subgraph is at block 2. Since we don't ever delete
+        // the genesis block, the only block eligible for cleanup is BLOCK_ONE
+        // and the first retained block is block 2.
+        block_store::set_chain(
+            vec![
+                &*GENESIS_BLOCK,
+                &*BLOCK_ONE,
+                &*BLOCK_TWO,
+                &*BLOCK_THREE_TIMESTAMP_FIREHOSE,
+            ],
+            NETWORK_NAME,
+        );
+        let chain_store = store
+            .block_store()
+            .chain_store(NETWORK_NAME)
+            .expect("fake chain store");
+
+        let (_network, number, timestamp) = chain_store
+            .block_number(&BLOCK_THREE_TIMESTAMP_FIREHOSE.block_hash())
+            .await
+            .expect("block_number to return correct number and timestamp")
+            .unwrap();
+        assert_eq!(number, 3);
+        assert_eq!(timestamp.unwrap(), EXPECTED_TS);
+    })
+}
+
+#[test]
 /// checks if retrieving the timestamp from the data blob works.
 /// on ethereum, the block has timestamp as U256 so it will always have a value
 fn parse_null_timestamp() {
@@ -2119,11 +2134,11 @@ fn reorg_tracking() {
         check_state!(store, 0, 0, 4);
 
         // Back to block 3
-        revert_block(&store, &deployment, &*TEST_BLOCK_3_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_3_PTR).await;
         check_state!(store, 1, 1, 3);
 
         // Back to block 2
-        revert_block(&store, &deployment, &*TEST_BLOCK_2_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
         check_state!(store, 2, 2, 2);
 
         // Forward to block 3
@@ -2139,13 +2154,13 @@ fn reorg_tracking() {
         check_state!(store, 2, 2, 5);
 
         // Revert all the way back to block 2
-        revert_block(&store, &deployment, &*TEST_BLOCK_4_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_4_PTR).await;
         check_state!(store, 3, 2, 4);
 
-        revert_block(&store, &deployment, &*TEST_BLOCK_3_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_3_PTR).await;
         check_state!(store, 4, 2, 3);
 
-        revert_block(&store, &deployment, &*TEST_BLOCK_2_PTR).await;
+        revert_block(&store, &deployment, &TEST_BLOCK_2_PTR).await;
         check_state!(store, 5, 3, 2);
     })
 }

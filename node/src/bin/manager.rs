@@ -1,22 +1,25 @@
 use clap::{Parser, Subcommand};
 use config::PoolSize;
 use git_testament::{git_testament, render_testament};
+use graph::bail;
+use graph::endpoint::EndpointMetrics;
+use graph::log::logger_with_levels;
+use graph::prelude::{MetricsRegistry, BLOCK_NUMBER_MAX};
 use graph::{data::graphql::effort::LoadManager, prelude::chrono, prometheus::Registry};
 use graph::{
-    log::logger,
     prelude::{
         anyhow::{self, Context as AnyhowContextTrait},
-        info, o, slog, tokio, Logger, NodeId, ENV_VARS,
+        info, tokio, Logger, NodeId,
     },
     url::Url,
 };
 use graph_chain_ethereum::{EthereumAdapter, EthereumNetworks};
-use graph_core::MetricsRegistry;
 use graph_graphql::prelude::GraphQlRunner;
 use graph_node::config::{self, Config as Cfg};
+use graph_node::manager::color::Terminal;
 use graph_node::manager::commands;
 use graph_node::{
-    chain::create_ethereum_networks,
+    chain::create_all_ethereum_networks,
     manager::{deployment::DeploymentSearch, PanicSubscriptionManager},
     store_builder::StoreBuilder,
     MetricsContext,
@@ -47,6 +50,19 @@ lazy_static! {
 pub struct Opt {
     #[clap(
         long,
+        default_value = "off",
+        env = "GRAPHMAN_LOG",
+        help = "level for log output in slog format"
+    )]
+    pub log_level: String,
+    #[clap(
+        long,
+        default_value = "auto",
+        help = "whether to colorize the output. Set to 'auto' to colorize only on\nterminals (the default), 'always' to always colorize, or 'never'\nto not colorize at all"
+    )]
+    pub color: String,
+    #[clap(
+        long,
         short,
         env = "GRAPH_NODE_CONFIG",
         help = "the name of the configuration file\n"
@@ -57,7 +73,7 @@ pub struct Opt {
         default_value = "default",
         value_name = "NODE_ID",
         env = "GRAPH_NODE_ID",
-        help = "a unique identifier for this node.\nShould have the same value between consecutive node restarts\n"
+        help = "a unique identifier for this node. Should have the same value\nbetween consecutive node restarts\n"
     )]
     pub node_id: String,
     #[clap(
@@ -65,13 +81,13 @@ pub struct Opt {
         value_name = "{HOST:PORT|URL}",
         default_value = "https://api.thegraph.com/ipfs/",
         env = "IPFS",
-        help = "HTTP addresses of IPFS nodes"
+        help = "HTTP addresses of IPFS nodes\n"
     )]
     pub ipfs: Vec<String>,
     #[clap(
         long,
         default_value = "3",
-        help = "the size for connection pools. Set to 0\n to use pool size from configuration file\n corresponding to NODE_ID"
+        help = "the size for connection pools. Set to 0 to use pool size from\nconfiguration file corresponding to NODE_ID\n"
     )]
     pub pool_size: u32,
     #[clap(long, value_name = "URL", help = "Base URL for forking subgraphs")]
@@ -97,7 +113,10 @@ pub enum Command {
     /// the shard by adding `:shard` to the IPFS hash.
     Info {
         /// The deployment (see above)
-        deployment: DeploymentSearch,
+        deployment: Option<DeploymentSearch>,
+        /// List all the deployments in the graph-node
+        #[clap(long, short)]
+        all: bool,
         /// List only current version
         #[clap(long, short)]
         current: bool,
@@ -222,21 +241,61 @@ pub enum Command {
     #[clap(subcommand)]
     Index(IndexCommand),
 
-    /// Prune deployments
+    /// Prune a deployment
+    ///
+    /// Keep only entity versions that are needed to respond to queries at
+    /// block heights that are within `history` blocks of the subgraph head;
+    /// all other entity versions are removed.
+    ///
+    /// Unless `--once` is given, this setting is permanent and the subgraph
+    /// will periodically be pruned to remove history as the subgraph head
+    /// moves forward.
     Prune {
         /// The deployment to prune (see `help info`)
         deployment: DeploymentSearch,
-        /// Prune tables with a ratio of entities to entity versions lower than this
-        #[clap(long, short, default_value = "0.20")]
-        prune_ratio: f64,
+        /// Prune by rebuilding tables when removing more than this fraction
+        /// of history. Defaults to GRAPH_STORE_HISTORY_REBUILD_THRESHOLD
+        #[clap(long, short)]
+        rebuild_threshold: Option<f64>,
+        /// Prune by deleting when removing more than this fraction of
+        /// history but less than rebuild_threshold. Defaults to
+        /// GRAPH_STORE_HISTORY_DELETE_THRESHOLD
+        #[clap(long, short)]
+        delete_threshold: Option<f64>,
         /// How much history to keep in blocks
-        #[clap(long, short, default_value = "10000")]
+        #[clap(long, short = 'y', default_value = "10000")]
         history: usize,
+        /// Prune only this once
+        #[clap(long, short)]
+        once: bool,
     },
 
     /// General database management
     #[clap(subcommand)]
     Database(DatabaseCommand),
+
+    /// Delete a deployment and all it's indexed data
+    ///
+    /// The deployment can be specified as either a subgraph name, an IPFS
+    /// hash `Qm..`, or the database namespace `sgdNNN`. Since the same IPFS
+    /// hash can be deployed in multiple shards, it is possible to specify
+    /// the shard by adding `:shard` to the IPFS hash.
+    Drop {
+        /// The deployment identifier
+        deployment: DeploymentSearch,
+        /// Search only for current version
+        #[clap(long, short)]
+        current: bool,
+        /// Search only for pending versions
+        #[clap(long, short)]
+        pending: bool,
+        /// Search only for used (current and pending) versions
+        #[clap(long, short)]
+        used: bool,
+        /// Skip confirmation prompt
+        #[clap(long, short)]
+        force: bool,
+    },
 }
 
 impl Command {
@@ -336,6 +395,12 @@ pub enum CopyCommand {
         /// How far behind `src` subgraph head to copy
         #[clap(long, short, default_value = "200")]
         offset: u32,
+        /// Activate this copy once it has synced
+        #[clap(long, short, conflicts_with = "replace")]
+        activate: bool,
+        /// Replace the source with this copy once it has synced
+        #[clap(long, short, conflicts_with = "activate")]
+        replace: bool,
         /// The source deployment (see `help info`)
         src: DeploymentSearch,
         /// The name of the database shard into which to copy
@@ -391,7 +456,6 @@ pub enum ChainCommand {
     CheckBlocks {
         #[clap(subcommand)] // Note that we mark a field as a subcommand
         method: CheckBlockMethod,
-
         /// Chain name (must be an existing chain, see 'chain list')
         #[clap(empty_values = false)]
         chain_name: String,
@@ -404,6 +468,36 @@ pub enum ChainCommand {
         /// Skips confirmation prompt
         #[clap(long, short)]
         force: bool,
+    },
+
+    /// Execute operations on call cache.
+    CallCache {
+        #[clap(subcommand)]
+        method: CallCacheCommand,
+        /// Chain name (must be an existing chain, see 'chain list')
+        #[clap(empty_values = false)]
+        chain_name: String,
+    },
+}
+
+#[derive(Clone, Debug, Subcommand)]
+pub enum CallCacheCommand {
+    /// Remove the call cache of the specified chain.
+    ///
+    /// Either remove entries in the range `--from` and `--to`, or remove
+    /// the entire cache with `--remove-entire-cache`. Removing the entire
+    /// cache can reduce indexing performance significantly and should
+    /// generally be avoided.
+    Remove {
+        /// Remove the entire cache
+        #[clap(long, conflicts_with_all = &["from", "to"])]
+        remove_entire_cache: bool,
+        /// Starting block number
+        #[clap(long, short, conflicts_with = "remove-entire-cache", requires = "to")]
+        from: Option<i32>,
+        /// Ending block number
+        #[clap(long, short, conflicts_with = "remove-entire-cache", requires = "from")]
+        to: Option<i32>,
     },
 }
 
@@ -436,8 +530,47 @@ pub enum StatsCommand {
     Analyze {
         /// The deployment (see `help info`).
         deployment: DeploymentSearch,
-        /// The name of the Entity to ANALYZE, in camel case
-        entity: String,
+        /// The name of the Entity to ANALYZE, in camel case. Analyze all
+        /// tables if omitted
+        entity: Option<String>,
+    },
+    /// Show statistics targets for the statistics collector
+    ///
+    /// For all tables in the given deployment, show the target for each
+    /// column. A value of `-1` means that the global default is used
+    Target {
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
+    },
+    /// Set the statistics targets for the statistics collector
+    ///
+    /// Set (or reset) the target for a deployment. The statistics target
+    /// determines how much of a table Postgres will sample when it analyzes
+    /// a table. This can be particularly beneficial when Postgres chooses
+    /// suboptimal query plans for some queries. Increasing the target will
+    /// make analyzing tables take longer and will require more space in
+    /// Postgres' internal statistics storage.
+    ///
+    /// If no `columns` are provided, change the statistics target for the
+    /// `id` and `block_range` columns which will usually be enough to
+    /// improve query performance, but it might be necessary to increase the
+    /// target for other columns, too.
+    SetTarget {
+        /// The value of the statistics target
+        #[clap(short, long, default_value = "200", conflicts_with = "reset")]
+        target: u32,
+        /// Reset the target so the default is used
+        #[clap(long, conflicts_with = "target")]
+        reset: bool,
+        /// Do not analyze changed tables
+        #[clap(long)]
+        no_analyze: bool,
+        /// The deployment (see `help info`).
+        deployment: DeploymentSearch,
+        /// The table for which to set the target, all if omitted
+        entity: Option<String>,
+        /// The columns to which to apply the target. Defaults to `id, block_range`
+        columns: Vec<String>,
     },
 }
 
@@ -477,7 +610,23 @@ pub enum IndexCommand {
     },
     /// Lists existing indexes for a given Entity
     List {
-        /// The deployment (see `help info`).
+        /// Do not list attribute indexes
+        #[clap(short = 'A', long)]
+        no_attribute_indexes: bool,
+        /// Do not list any of the indexes that are generated by default,
+        /// including attribute indexes
+        #[clap(short = 'D', long)]
+        no_default_indexes: bool,
+        /// Print SQL statements instead of a more human readable overview
+        #[clap(long)]
+        sql: bool,
+        /// When `--sql` is used, make statements run concurrently
+        #[clap(long, requires = "sql")]
+        concurrent: bool,
+        /// When `--sql` is used, add `if not exists` clause
+        #[clap(long, requires = "sql")]
+        if_not_exists: bool,
+        ///  The deployment (see `help info`).
         #[clap(empty_values = false)]
         deployment: DeploymentSearch,
         /// The Entity name.
@@ -509,22 +658,53 @@ pub enum DatabaseCommand {
     /// other shards. It makes it possible to fix these mappings when a
     /// database migration was interrupted before it could rebuild the
     /// mappings
-    Remap,
+    ///
+    /// Each shard imports certain tables from all other shards. To recreate
+    /// the mappings in a given shard, use `--dest SHARD`, to recreate the
+    /// mappings in other shards that depend on a shard, use `--source
+    /// SHARD`. Without `--dest` and `--source` options, recreate all
+    /// possible mappings. Recreating mappings needlessly is harmless, but
+    /// might take quite a bit of time with a lot of shards.
+    Remap {
+        /// Only refresh mappings from SOURCE
+        #[clap(long, short)]
+        source: Option<String>,
+        /// Only refresh mappings inside DEST
+        #[clap(long, short)]
+        dest: Option<String>,
+        /// Continue remapping even when one operation fails
+        #[clap(long, short)]
+        force: bool,
+    },
 }
 #[derive(Clone, Debug, Subcommand)]
 pub enum CheckBlockMethod {
-    /// The number of the target block
-    ByHash { hash: String },
-
     /// The hash of the target block
-    ByNumber { number: i32 },
+    ByHash {
+        /// The block hash to verify
+        hash: String,
+    },
+
+    /// The number of the target block
+    ByNumber {
+        /// The block number to verify
+        number: i32,
+        /// Delete duplicated blocks (by number) if found
+        #[clap(long, short, action)]
+        delete_duplicates: bool,
+    },
 
     /// A block number range, inclusive on both ends.
     ByRange {
+        /// The first block number to verify
         #[clap(long, short)]
         from: Option<i32>,
+        /// The last block number to verify
         #[clap(long, short)]
         to: Option<i32>,
+        /// Delete duplicated blocks (by number) if found
+        #[clap(long, short, action)]
+        delete_duplicates: bool,
     },
 }
 
@@ -626,7 +806,7 @@ impl Context {
 
         Arc::new(SubscriptionManager::new(
             self.logger.clone(),
-            primary.connection.to_owned(),
+            primary.connection.clone(),
             self.registry.clone(),
         ))
     }
@@ -665,7 +845,7 @@ impl Context {
             &self.node_id,
             &self.config,
             self.fork_base,
-            self.registry,
+            self.registry.clone(),
         );
 
         for pool in pools.values() {
@@ -678,6 +858,7 @@ impl Context {
             subgraph_store,
             HashMap::default(),
             vec![],
+            self.registry,
         );
 
         (store, pools)
@@ -717,14 +898,15 @@ impl Context {
     async fn ethereum_networks(&self) -> anyhow::Result<EthereumNetworks> {
         let logger = self.logger.clone();
         let registry = self.metrics_registry();
-        create_ethereum_networks(logger, registry, &self.config).await
+        let metrics = Arc::new(EndpointMetrics::mock());
+        create_all_ethereum_networks(logger, registry, &self.config, metrics).await
     }
 
     fn chain_store(self, chain_name: &str) -> anyhow::Result<Arc<ChainStore>> {
         use graph::components::store::BlockStore;
         self.store()
             .block_store()
-            .chain_store(&chain_name)
+            .chain_store(chain_name)
             .ok_or_else(|| anyhow::anyhow!("Could not find a network named '{}'", chain_name))
     }
 
@@ -737,8 +919,7 @@ impl Context {
         let ethereum_adapter = ethereum_networks
             .networks
             .get(chain_name)
-            .map(|adapters| adapters.cheapest())
-            .flatten()
+            .and_then(|adapters| adapters.cheapest())
             .ok_or(anyhow::anyhow!(
                 "Failed to obtain an Ethereum adapter for chain '{}'",
                 chain_name
@@ -751,12 +932,11 @@ impl Context {
 async fn main() -> anyhow::Result<()> {
     let opt = Opt::parse();
 
+    Terminal::set_color_preference(&opt.color);
+
     let version_label = opt.version_label.clone();
     // Set up logger
-    let logger = match ENV_VARS.log_levels {
-        Some(_) => logger(false),
-        None => Logger::root(slog::Discard, o!()),
-    };
+    let logger = logger_with_levels(false, Some(&opt.log_level));
 
     // Log version information
     info!(
@@ -788,7 +968,7 @@ async fn main() -> anyhow::Result<()> {
     let fork_base = match &opt.fork_base {
         Some(url) => {
             // Make sure the endpoint ends with a terminating slash.
-            let url = if !url.ends_with("/") {
+            let url = if !url.ends_with('/') {
                 let mut url = url.clone();
                 url.push('/');
                 Url::parse(&url)
@@ -825,14 +1005,30 @@ async fn main() -> anyhow::Result<()> {
             pending,
             status,
             used,
+            all,
         } => {
             let (primary, store) = if status {
                 let (store, primary) = ctx.store_and_primary();
-                (primary.clone(), Some(store))
+                (primary, Some(store))
             } else {
                 (ctx.primary_pool(), None)
             };
-            commands::info::run(primary, store, deployment, current, pending, used)
+
+            match deployment {
+                Some(deployment) => {
+                    commands::info::run(primary, store, deployment, current, pending, used).err();
+                }
+                None => {
+                    if all {
+                        let deployment = DeploymentSearch::All;
+                        commands::info::run(primary, store, deployment, current, pending, used)
+                            .err();
+                    } else {
+                        bail!("Please specify a deployment or use --all to list all deployments");
+                    }
+                }
+            };
+            Ok(())
         }
         Unused(cmd) => {
             let store = ctx.subgraph_store();
@@ -848,7 +1044,7 @@ async fn main() -> anyhow::Result<()> {
                 } => {
                     let count = count.unwrap_or(1_000_000);
                     let older = older.map(|older| chrono::Duration::minutes(older as i64));
-                    commands::unused_deployments::remove(store, count, deployment, older)
+                    commands::unused_deployments::remove(store, count, deployment.as_deref(), older)
                 }
             }
         }
@@ -869,7 +1065,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
-        Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
+        Remove { name } => commands::remove::run(ctx.subgraph_store(), &name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
         Unassign { deployment } => {
             let sender = ctx.notification_sender();
@@ -952,10 +1148,15 @@ async fn main() -> anyhow::Result<()> {
                     shard,
                     node,
                     offset,
+                    activate,
+                    replace,
                 } => {
                     let shards: Vec<_> = ctx.config.stores.keys().cloned().collect();
                     let (store, primary) = ctx.store_and_primary();
-                    commands::copy::create(store, primary, src, shard, shards, node, offset).await
+                    commands::copy::create(
+                        store, primary, src, shard, shards, node, offset, activate, replace,
+                    )
+                    .await
                 }
                 Activate { deployment, shard } => {
                     commands::copy::activate(ctx.subgraph_store(), deployment, shard)
@@ -1000,11 +1201,33 @@ async fn main() -> anyhow::Result<()> {
                         ByHash { hash } => {
                             by_hash(&hash, chain_store, &ethereum_adapter, &logger).await
                         }
-                        ByNumber { number } => {
-                            by_number(number, chain_store, &ethereum_adapter, &logger).await
+                        ByNumber {
+                            number,
+                            delete_duplicates,
+                        } => {
+                            by_number(
+                                number,
+                                chain_store,
+                                &ethereum_adapter,
+                                &logger,
+                                delete_duplicates,
+                            )
+                            .await
                         }
-                        ByRange { from, to } => {
-                            by_range(chain_store, &ethereum_adapter, from, to, &logger).await
+                        ByRange {
+                            from,
+                            to,
+                            delete_duplicates,
+                        } => {
+                            by_range(
+                                chain_store,
+                                &ethereum_adapter,
+                                from,
+                                to,
+                                &logger,
+                                delete_duplicates,
+                            )
+                            .await
                         }
                     }
                 }
@@ -1012,6 +1235,27 @@ async fn main() -> anyhow::Result<()> {
                     use commands::check_blocks::truncate;
                     let chain_store = ctx.chain_store(&chain_name)?;
                     truncate(chain_store, force)
+                }
+                CallCache { method, chain_name } => {
+                    match method {
+                        CallCacheCommand::Remove {
+                            from,
+                            to,
+                            remove_entire_cache,
+                        } => {
+                            let chain_store = ctx.chain_store(&chain_name)?;
+                            if !remove_entire_cache && from.is_none() && to.is_none() {
+                                bail!("you must specify either --from and --to or --remove-entire-cache");
+                            }
+                            let (from, to) = if remove_entire_cache {
+                                (0, BLOCK_NUMBER_MAX)
+                            } else {
+                                // Clap makes sure that this does not panic
+                                (from.unwrap(), to.unwrap())
+                            };
+                            commands::chain::clear_call_cache(chain_store, from, to).await
+                        }
+                    }
                 }
             }
         }
@@ -1038,7 +1282,38 @@ async fn main() -> anyhow::Result<()> {
                 Analyze { deployment, entity } => {
                     let (store, primary_pool) = ctx.store_and_primary();
                     let subgraph_store = store.subgraph_store();
-                    commands::stats::analyze(subgraph_store, primary_pool, deployment, &entity)
+                    commands::stats::analyze(
+                        subgraph_store,
+                        primary_pool,
+                        deployment,
+                        entity.as_deref(),
+                    )
+                }
+                Target { deployment } => {
+                    let (store, primary_pool) = ctx.store_and_primary();
+                    let subgraph_store = store.subgraph_store();
+                    commands::stats::target(subgraph_store, primary_pool, &deployment)
+                }
+                SetTarget {
+                    target,
+                    reset,
+                    no_analyze,
+                    deployment,
+                    entity,
+                    columns,
+                } => {
+                    let (store, primary) = ctx.store_and_primary();
+                    let store = store.subgraph_store();
+                    let target = if reset { -1 } else { target as i32 };
+                    commands::stats::set_target(
+                        store,
+                        primary,
+                        &deployment,
+                        entity.as_deref(),
+                        columns,
+                        target,
+                        no_analyze,
+                    )
                 }
             }
         }
@@ -1063,8 +1338,27 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await
                 }
-                List { deployment, entity } => {
-                    commands::index::list(subgraph_store, primary_pool, deployment, &entity).await
+                List {
+                    deployment,
+                    entity,
+                    no_attribute_indexes,
+                    no_default_indexes,
+                    sql,
+                    concurrent,
+                    if_not_exists,
+                } => {
+                    commands::index::list(
+                        subgraph_store,
+                        primary_pool,
+                        deployment,
+                        &entity,
+                        no_attribute_indexes,
+                        no_default_indexes,
+                        sql,
+                        concurrent,
+                        if_not_exists,
+                    )
+                    .await
                 }
                 Drop {
                     deployment,
@@ -1083,19 +1377,57 @@ async fn main() -> anyhow::Result<()> {
                     println!("All database migrations have been applied");
                     Ok(())
                 }
-                DatabaseCommand::Remap => {
+                DatabaseCommand::Remap {
+                    source,
+                    dest,
+                    force,
+                } => {
                     let store_builder = ctx.store_builder().await;
-                    commands::database::remap(&store_builder.coord).await
+                    commands::database::remap(&store_builder.coord, source, dest, force).await
                 }
             }
         }
         Prune {
             deployment,
             history,
-            prune_ratio,
+            rebuild_threshold,
+            delete_threshold,
+            once,
         } => {
             let (store, primary_pool) = ctx.store_and_primary();
-            commands::prune::run(store, primary_pool, deployment, history, prune_ratio).await
+            commands::prune::run(
+                store,
+                primary_pool,
+                deployment,
+                history,
+                rebuild_threshold,
+                delete_threshold,
+                once,
+            )
+            .await
+        }
+        Drop {
+            deployment,
+            current,
+            pending,
+            used,
+            force,
+        } => {
+            let sender = ctx.notification_sender();
+            let (store, primary_pool) = ctx.store_and_primary();
+            let subgraph_store = store.subgraph_store();
+
+            commands::drop::run(
+                primary_pool,
+                subgraph_store,
+                sender,
+                deployment,
+                current,
+                pending,
+                used,
+                force,
+            )
+            .await
         }
     }
 }

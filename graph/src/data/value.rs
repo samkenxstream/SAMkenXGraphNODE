@@ -13,7 +13,7 @@ pub struct Word(Box<str>);
 
 impl Word {
     pub fn as_str(&self) -> &str {
-        &*self.0
+        &self.0
     }
 }
 
@@ -27,7 +27,7 @@ impl std::ops::Deref for Word {
     type Target = str;
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }
 
@@ -40,6 +40,12 @@ impl From<&str> for Word {
 impl From<String> for Word {
     fn from(s: String) -> Self {
         Word(s.into_boxed_str())
+    }
+}
+
+impl From<Word> for String {
+    fn from(w: Word) -> Self {
+        w.0.into()
     }
 }
 
@@ -137,7 +143,7 @@ impl Iterator for ObjectOwningIter {
     type Item = (Word, Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(entry) = self.iter.next() {
+        for entry in self.iter.by_ref() {
             if let Some(key) = entry.key {
                 return Some((key, entry.value));
             }
@@ -173,7 +179,7 @@ impl<'a> Iterator for ObjectIter<'a> {
     type Item = (&'a str, &'a Value);
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(entry) = self.iter.next() {
+        for entry in self.iter.by_ref() {
             if let Some(key) = &entry.key {
                 return Some((key.as_str(), &entry.value));
             }

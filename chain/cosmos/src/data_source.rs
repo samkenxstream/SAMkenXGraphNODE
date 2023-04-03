@@ -1,15 +1,15 @@
 use std::collections::{HashMap, HashSet};
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 
-use anyhow::{Error, Result};
+use anyhow::{Context, Error, Result};
 
 use graph::{
     blockchain::{self, Block, Blockchain, TriggerWithHandler},
     components::store::StoredDynamicDataSource,
     data::subgraph::DataSourceContext,
     prelude::{
-        anyhow, async_trait, info, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize,
-        Link, LinkResolver, Logger,
+        anyhow, async_trait, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Link,
+        LinkResolver, Logger,
     },
 };
 
@@ -37,6 +37,10 @@ pub struct DataSource {
 }
 
 impl blockchain::DataSource<Chain> for DataSource {
+    fn from_template_info(_template_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
+        Err(anyhow!(TEMPLATE_ERROR))
+    }
+
     fn address(&self) -> Option<&[u8]> {
         None
     }
@@ -192,10 +196,8 @@ impl blockchain::DataSource<Chain> for DataSource {
         // OR
         // 1 or more handlers with origin filter
         for (event_type, origins) in event_types.iter() {
-            if origins.len() > 1 {
-                if !origins.iter().all(Option::is_some) {
-                    errors.push(combined_origins_err(event_type))
-                }
+            if origins.len() > 1 && !origins.iter().all(Option::is_some) {
+                errors.push(combined_origins_err(event_type))
             }
         }
 
@@ -318,19 +320,14 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
-
-        let mapping = mapping.resolve(resolver, logger).await?;
+        let mapping = mapping.resolve(resolver, logger).await.with_context(|| {
+            format!(
+                "failed to resolve data source {} with source {}",
+                name, source.start_block
+            )
+        })?;
 
         DataSource::from_manifest(kind, network, name, source, mapping, context)
-    }
-}
-
-impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
-    type Error = Error;
-
-    fn try_from(_info: DataSourceTemplateInfo<Chain>) -> Result<Self> {
-        Err(anyhow!(TEMPLATE_ERROR))
     }
 }
 
@@ -411,8 +408,10 @@ impl UnresolvedMapping {
 
         let api_version = semver::Version::parse(&api_version)?;
 
-        info!(logger, "Resolve mapping"; "link" => &link.link);
-        let module_bytes = resolver.cat(logger, &link).await?;
+        let module_bytes = resolver
+            .cat(logger, &link)
+            .await
+            .with_context(|| format!("failed to resolve mapping {}", link.link))?;
 
         Ok(Mapping {
             api_version,

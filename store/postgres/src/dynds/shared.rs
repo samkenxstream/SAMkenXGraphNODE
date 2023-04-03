@@ -12,6 +12,7 @@ use diesel::{insert_into, pg::PgConnection};
 use graph::{
     components::store::StoredDynamicDataSource,
     constraint_violation,
+    data_source::CausalityRegion,
     prelude::{
         bigdecimal::ToPrimitive, serde_json, BigDecimal, BlockNumber, BlockPtr, DeploymentHash,
         StoreError,
@@ -84,7 +85,8 @@ pub(super) fn load(
 
             // The shared schema is only used for legacy deployments, and therefore not used for
             // subgraphs that use file data sources.
-            is_offchain: false,
+            done_at: None,
+            causality_region: CausalityRegion::ONCHAIN,
         };
 
         if data_sources.last().and_then(|d| d.creation_block) > data_source.creation_block {
@@ -113,17 +115,18 @@ pub(super) fn insert(
     }
 
     let dds: Vec<_> = data_sources
-        .into_iter()
+        .iter()
         .map(|ds| {
             let StoredDynamicDataSource {
                 manifest_idx: _,
                 param,
                 context,
                 creation_block: _,
-                is_offchain,
+                done_at: _,
+                causality_region,
             } = ds;
 
-            if *is_offchain {
+            if causality_region != &CausalityRegion::ONCHAIN {
                 return Err(constraint_violation!(
                     "using shared data source schema with file data sources"
                 ));
@@ -180,11 +183,7 @@ pub(crate) fn copy(
         return Ok(0);
     }
 
-    let src_nsp = if src.shard == dst.shard {
-        "subgraphs".to_string()
-    } else {
-        ForeignServer::metadata_schema(&src.shard)
-    };
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
 
     // Check whether there are any dynamic data sources for dst which
     // indicates we already did copy
@@ -210,7 +209,7 @@ pub(crate) fn copy(
         src_nsp = src_nsp
     );
 
-    Ok(sql_query(&query)
+    Ok(sql_query(query)
         .bind::<Text, _>(src.deployment.as_str())
         .bind::<Text, _>(dst.deployment.as_str())
         .bind::<Integer, _>(target_block)

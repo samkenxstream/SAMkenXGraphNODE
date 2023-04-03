@@ -34,7 +34,7 @@ use diesel::{
 use graph::{
     components::store::EntityType,
     constraint_violation,
-    prelude::{info, o, warn, BlockNumber, BlockPtr, Logger, StoreError},
+    prelude::{info, o, warn, BlockNumber, BlockPtr, Logger, StoreError, ENV_VARS},
 };
 
 use crate::{
@@ -51,7 +51,7 @@ const INITIAL_BATCH_SIZE: i64 = 10_000;
 /// arrays can be large and large arrays will slow down copying a lot. We
 /// therefore tread lightly in that case
 const INITIAL_BATCH_SIZE_LIST: i64 = 100;
-const TARGET_DURATION: Duration = Duration::from_secs(5 * 60);
+
 const LOG_INTERVAL: Duration = Duration::from_secs(3 * 60);
 
 /// If replicas are lagging by more than this, the copying code will pause
@@ -104,7 +104,7 @@ table! {
     }
 }
 
-#[derive(Copy, Clone, PartialEq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub enum Status {
     Finished,
     Cancelled,
@@ -283,12 +283,23 @@ impl CopyState {
     }
 }
 
+pub(crate) fn source(conn: &PgConnection, dst: &Site) -> Result<Option<DeploymentId>, StoreError> {
+    use copy_state as cs;
+
+    cs::table
+        .filter(cs::dst.eq(dst.id))
+        .select(cs::src)
+        .get_result::<DeploymentId>(conn)
+        .optional()
+        .map_err(StoreError::from)
+}
+
 /// Track the desired size of a batch in such a way that doing the next
 /// batch gets close to TARGET_DURATION for the time it takes to copy one
 /// batch, but don't step up the size by more than 2x at once
 #[derive(Debug, Queryable)]
 pub(crate) struct AdaptiveBatchSize {
-    size: i64,
+    pub size: i64,
 }
 
 impl AdaptiveBatchSize {
@@ -308,8 +319,9 @@ impl AdaptiveBatchSize {
     pub fn adapt(&mut self, duration: Duration) {
         // Avoid division by zero
         let duration = duration.as_millis().max(1);
-        let new_batch_size =
-            self.size as f64 * TARGET_DURATION.as_millis() as f64 / duration as f64;
+        let new_batch_size = self.size as f64
+            * ENV_VARS.store.batch_target_duration.as_millis() as f64
+            / duration as f64;
         self.size = (2 * self.size).min(new_batch_size.round() as i64);
     }
 }
@@ -407,7 +419,7 @@ impl TableState {
         } else {
             "lower(block_range) <= $1"
         };
-        let target_vid = sql_query(&format!(
+        let target_vid = sql_query(format!(
             "select coalesce(max(vid), -1) as max_vid from {} where {}",
             src.qualified_name.as_str(),
             max_block_clause

@@ -1,8 +1,8 @@
 use super::block_stream::{BlockStream, BlockStreamEvent, FirehoseMapper};
+use super::client::ChainClient;
 use super::{Blockchain, TriggersAdapter};
 use crate::blockchain::block_stream::FirehoseCursor;
 use crate::blockchain::TriggerFilter;
-use crate::firehose::ForkStep::*;
 use crate::prelude::*;
 use crate::util::backoff::ExponentialBackoff;
 use crate::{firehose, firehose::FirehoseEndpoint};
@@ -15,7 +15,6 @@ use tonic::Status;
 
 struct FirehoseBlockStreamMetrics {
     deployment: DeploymentHash,
-    provider: String,
     restarts: CounterVec,
     connect_duration: GaugeVec,
     time_between_responses: HistogramVec,
@@ -23,14 +22,9 @@ struct FirehoseBlockStreamMetrics {
 }
 
 impl FirehoseBlockStreamMetrics {
-    pub fn new(
-        registry: Arc<dyn MetricsRegistry>,
-        deployment: DeploymentHash,
-        provider: String,
-    ) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>, deployment: DeploymentHash) -> Self {
         Self {
             deployment,
-            provider,
 
             restarts: registry
                 .global_counter_vec(
@@ -66,36 +60,36 @@ impl FirehoseBlockStreamMetrics {
         }
     }
 
-    fn observe_successful_connection(&self, time: &mut Instant) {
+    fn observe_successful_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "true"])
+            .with_label_values(&[&self.deployment, &provider, "true"])
             .inc();
         self.connect_duration
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
         *time = Instant::now();
     }
 
-    fn observe_failed_connection(&self, time: &mut Instant) {
+    fn observe_failed_connection(&self, time: &mut Instant, provider: &str) {
         self.restarts
-            .with_label_values(&[&self.deployment, &self.provider, "false"])
+            .with_label_values(&[&self.deployment, &provider, "false"])
             .inc();
         self.connect_duration
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .set(time.elapsed().as_secs_f64());
 
         // Reset last connection timestamp
         *time = Instant::now();
     }
 
-    fn observe_response(&self, kind: &str, time: &mut Instant) {
+    fn observe_response(&self, kind: &str, time: &mut Instant, provider: &str) {
         self.time_between_responses
-            .with_label_values(&[&self.deployment, &self.provider])
+            .with_label_values(&[&self.deployment, &provider])
             .observe(time.elapsed().as_secs_f64());
         self.responses
-            .with_label_values(&[&self.deployment, &self.provider, kind])
+            .with_label_values(&[&self.deployment, &provider, kind])
             .inc();
 
         // Reset last response timestamp
@@ -113,7 +107,7 @@ where
 {
     pub fn new<F>(
         deployment: DeploymentHash,
-        endpoint: Arc<FirehoseEndpoint>,
+        client: Arc<ChainClient<C>>,
         subgraph_current_block: Option<BlockPtr>,
         cursor: FirehoseCursor,
         mapper: Arc<F>,
@@ -121,11 +115,15 @@ where
         filter: Arc<C::TriggerFilter>,
         start_blocks: Vec<BlockNumber>,
         logger: Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self
     where
         F: FirehoseMapper<C> + 'static,
     {
+        if !client.is_firehose() {
+            unreachable!("Firehose block stream called with rpc endpoint");
+        }
+
         let manifest_start_block_num = start_blocks
             .into_iter()
             .min()
@@ -133,13 +131,12 @@ where
             // start at Genesis block.
             .unwrap_or(0);
 
-        let metrics =
-            FirehoseBlockStreamMetrics::new(registry, deployment, endpoint.provider.clone());
-
+        let metrics = FirehoseBlockStreamMetrics::new(registry, deployment.clone());
         FirehoseBlockStream {
             stream: Box::pin(stream_blocks(
-                endpoint,
+                client,
                 cursor,
+                deployment,
                 mapper,
                 adapter,
                 filter,
@@ -153,8 +150,9 @@ where
 }
 
 fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
-    endpoint: Arc<FirehoseEndpoint>,
+    client: Arc<ChainClient<C>>,
     mut latest_cursor: FirehoseCursor,
+    deployment: DeploymentHash,
     mapper: Arc<F>,
     adapter: Arc<dyn TriggersAdapter<C>>,
     filter: Arc<C::TriggerFilter>,
@@ -218,12 +216,17 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
 
     try_stream! {
         loop {
+            let endpoint = client.firehose_endpoint()?;
+            let logger = logger.new(o!("deployment" => deployment.clone(), "provider" => endpoint.provider.to_string()));
+
             info!(
                 &logger,
                 "Blockstream disconnected, connecting";
                 "endpoint_uri" => format_args!("{}", endpoint),
                 "start_block" => start_block_num,
+                "subgraph" => &deployment,
                 "cursor" => latest_cursor.to_string(),
+                "provider_err_count" => endpoint.current_error_count(),
             );
 
             // We just reconnected, assume that we want to back off on errors
@@ -231,8 +234,8 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
 
             let mut request = firehose::Request {
                 start_block_num: start_block_num as i64,
-                start_cursor: latest_cursor.to_string(),
-                fork_steps: vec![StepNew as i32, StepUndo as i32],
+                cursor: latest_cursor.to_string(),
+                final_blocks_only: false,
                 ..Default::default()
             };
 
@@ -249,13 +252,14 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                     info!(&logger, "Blockstream connected");
 
                     // Track the time it takes to set up the block stream
-                    metrics.observe_successful_connection(&mut connect_start);
+                    metrics.observe_successful_connection(&mut connect_start, &endpoint.provider);
 
                     let mut last_response_time = Instant::now();
                     let mut expected_stream_end = false;
 
                     for await response in stream {
                         match process_firehose_response(
+                            &endpoint,
                             response,
                             &mut check_subgraph_continuity,
                             manifest_start_block_num,
@@ -269,7 +273,7 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                                 // Reset backoff because we got a good value from the stream
                                 backoff.reset();
 
-                                metrics.observe_response("proceed", &mut last_response_time);
+                                metrics.observe_response("proceed", &mut last_response_time, &endpoint.provider);
 
                                 yield event;
 
@@ -279,7 +283,7 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                                 // Reset backoff because we got a good value from the stream
                                 backoff.reset();
 
-                                metrics.observe_response("rewind", &mut last_response_time);
+                                metrics.observe_response("rewind", &mut last_response_time, &endpoint.provider);
 
                                 // It's totally correct to pass the None as the cursor here, if we are here, there
                                 // was no cursor before anyway, so it's totally fine to pass `None`
@@ -306,7 +310,7 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                                 // An example of this situation is if we get invalid block or transaction data
                                 // that cannot be decoded properly.
 
-                                metrics.observe_response("error", &mut last_response_time);
+                                metrics.observe_response("error", &mut last_response_time, &endpoint.provider);
 
                                 error!(logger, "{:#}", err);
                                 expected_stream_end = true;
@@ -324,7 +328,7 @@ fn stream_blocks<C: Blockchain, F: FirehoseMapper<C>>(
                     // case where we actually _want_ to back off in case we keep
                     // having connection errors.
 
-                    metrics.observe_failed_connection(&mut connect_start);
+                    metrics.observe_failed_connection(&mut connect_start, &endpoint.provider);
 
                     error!(logger, "Unable to connect to endpoint: {:#}", e);
                 }
@@ -344,6 +348,7 @@ enum BlockResponse<C: Blockchain> {
 }
 
 async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
+    endpoint: &Arc<FirehoseEndpoint>,
     result: Result<firehose::Response, Status>,
     check_subgraph_continuity: &mut bool,
     manifest_start_block_num: BlockNumber,
@@ -374,7 +379,7 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
                 );
 
                 let mut revert_to = mapper
-                    .final_block_ptr_for(logger, &block.block)
+                    .final_block_ptr_for(logger, endpoint, &block.block)
                     .await
                     .context("Could not fetch final block to revert to")?;
 
@@ -389,7 +394,7 @@ async fn process_firehose_response<C: Blockchain, F: FirehoseMapper<C>>(
                     }
 
                     revert_to = mapper
-                        .block_ptr_for_number(logger, block_num)
+                        .block_ptr_for_number(logger, endpoint, block_num)
                         .await
                         .context("Could not fetch manifest start block to revert to")?;
                 }

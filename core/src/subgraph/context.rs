@@ -1,8 +1,6 @@
 pub mod instance;
 
-use crate::polling_monitor::{
-    ipfs_service::IpfsService, spawn_monitor, PollingMonitor, PollingMonitorMetrics,
-};
+use crate::polling_monitor::{spawn_monitor, IpfsService, PollingMonitor, PollingMonitorMetrics};
 use anyhow::{self, Error};
 use bytes::Bytes;
 use graph::{
@@ -11,11 +9,11 @@ use graph::{
         store::{DeploymentId, SubgraphFork},
         subgraph::{MappingError, SharedProofOfIndexing},
     },
-    data_source::{offchain, DataSource, TriggerData},
+    data_source::{offchain, CausalityRegion, DataSource, TriggerData},
     ipfs_client::CidFile,
     prelude::{
-        BlockNumber, BlockState, CancelGuard, DeploymentHash, MetricsRegistry, RuntimeHostBuilder,
-        SubgraphInstanceMetrics, TriggerProcessor,
+        BlockNumber, BlockState, CancelGuard, CheapClone, DeploymentHash, MetricsRegistry,
+        RuntimeHostBuilder, SubgraphCountMetric, SubgraphInstanceMetrics, TriggerProcessor,
     },
     slog::Logger,
     tokio::sync::mpsc,
@@ -25,20 +23,44 @@ use std::sync::{Arc, RwLock};
 
 use self::instance::SubgraphInstance;
 
-pub type SharedInstanceKeepAliveMap = Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>;
+#[derive(Clone, Debug)]
+pub struct SubgraphKeepAlive {
+    alive_map: Arc<RwLock<HashMap<DeploymentId, CancelGuard>>>,
+    sg_metrics: Arc<SubgraphCountMetric>,
+}
+
+impl CheapClone for SubgraphKeepAlive {}
+
+impl SubgraphKeepAlive {
+    pub fn new(sg_metrics: Arc<SubgraphCountMetric>) -> Self {
+        Self {
+            sg_metrics,
+            alive_map: Arc::new(RwLock::new(HashMap::default())),
+        }
+    }
+
+    pub fn remove(&self, deployment_id: &DeploymentId) {
+        self.alive_map.write().unwrap().remove(deployment_id);
+        self.sg_metrics.running_count.dec();
+    }
+    pub fn insert(&self, deployment_id: DeploymentId, guard: CancelGuard) {
+        self.alive_map.write().unwrap().insert(deployment_id, guard);
+        self.sg_metrics.running_count.inc();
+    }
+}
 
 // The context keeps track of mutable in-memory state that is retained across blocks.
 //
 // Currently most of the changes are applied in `runner.rs`, but ideally more of that would be
-// refactored into the context so it wouldn't need `pub` fields. The entity cache should probaby
+// refactored into the context so it wouldn't need `pub` fields. The entity cache should probably
 // also be moved here.
-pub(crate) struct IndexingContext<C, T>
+pub struct IndexingContext<C, T>
 where
     T: RuntimeHostBuilder<C>,
     C: Blockchain,
 {
     instance: SubgraphInstance<C, T>,
-    pub instances: SharedInstanceKeepAliveMap,
+    pub instances: SubgraphKeepAlive,
     pub filter: C::TriggerFilter,
     pub offchain_monitor: OffchainMonitor,
     trigger_processor: Box<dyn TriggerProcessor<C, T>>,
@@ -47,7 +69,7 @@ where
 impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
     pub fn new(
         instance: SubgraphInstance<C, T>,
-        instances: SharedInstanceKeepAliveMap,
+        instances: SubgraphKeepAlive,
         filter: C::TriggerFilter,
         offchain_monitor: OffchainMonitor,
         trigger_processor: Box<dyn TriggerProcessor<C, T>>,
@@ -71,10 +93,11 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError> {
         self.process_trigger_in_hosts(
             logger,
-            &self.instance.hosts(),
+            self.instance.hosts(),
             block,
             trigger,
             state,
@@ -82,6 +105,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
             causality_region,
             debug_fork,
             subgraph_metrics,
+            instrument,
         )
         .await
     }
@@ -97,6 +121,7 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError> {
         self.trigger_processor
             .process_trigger(
@@ -109,19 +134,26 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
                 causality_region,
                 debug_fork,
                 subgraph_metrics,
+                instrument,
             )
             .await
     }
 
-    // Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
-    // that they are no longer candidates for `process_trigger`.
-    //
-    // This does not currently affect the `offchain_monitor` or the `filter`, so they will continue
-    // to include data sources that have been reverted. This is not ideal for performance, but it
-    // does not affect correctness since triggers that have no matching host will be ignored by
-    // `process_trigger`.
-    pub fn revert_data_sources(&mut self, reverted_block: BlockNumber) {
-        self.instance.revert_data_sources(reverted_block)
+    /// Removes data sources hosts with a creation block greater or equal to `reverted_block`, so
+    /// that they are no longer candidates for `process_trigger`.
+    ///
+    /// This does not currently affect the `offchain_monitor` or the `filter`, so they will continue
+    /// to include data sources that have been reverted. This is not ideal for performance, but it
+    /// does not affect correctness since triggers that have no matching host will be ignored by
+    /// `process_trigger`.
+    ///
+    /// File data sources that have been marked not done during this process will get re-queued
+    pub fn revert_data_sources(&mut self, reverted_block: BlockNumber) -> Result<(), Error> {
+        let removed = self.instance.revert_data_sources(reverted_block);
+
+        removed
+            .into_iter()
+            .try_for_each(|source| self.offchain_monitor.add_source(source))
     }
 
     pub fn add_dynamic_data_source(
@@ -140,9 +172,18 @@ impl<C: Blockchain, T: RuntimeHostBuilder<C>> IndexingContext<C, T> {
 
         Ok(host)
     }
+
+    pub fn causality_region_next_value(&mut self) -> CausalityRegion {
+        self.instance.causality_region_next_value()
+    }
+
+    #[cfg(debug_assertions)]
+    pub fn instance(&self) -> &SubgraphInstance<C, T> {
+        &self.instance
+    }
 }
 
-pub(crate) struct OffchainMonitor {
+pub struct OffchainMonitor {
     ipfs_monitor: PollingMonitor<CidFile>,
     ipfs_monitor_rx: mpsc::Receiver<(CidFile, Bytes)>,
 }
@@ -150,7 +191,7 @@ pub(crate) struct OffchainMonitor {
 impl OffchainMonitor {
     pub fn new(
         logger: Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         subgraph_hash: &DeploymentHash,
         ipfs_service: IpfsService,
     ) -> Self {

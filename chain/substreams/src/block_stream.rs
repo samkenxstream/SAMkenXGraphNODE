@@ -7,6 +7,7 @@ use graph::{
             BlockStream, BlockStreamBuilder as BlockStreamBuilderTrait, FirehoseCursor,
         },
         substreams_block_stream::SubstreamsBlockStream,
+        Blockchain,
     },
     components::store::DeploymentLocator,
     data::subgraph::UnifiedMappingApiVersion,
@@ -35,14 +36,11 @@ impl BlockStreamBuilderTrait<Chain> for BlockStreamBuilder {
         deployment: DeploymentLocator,
         block_cursor: FirehoseCursor,
         _start_blocks: Vec<BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
+        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<TriggerFilter>,
         _unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
-        let firehose_endpoint = match chain.endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow::format_err!("no firehose endpoint available")),
-        };
+        let firehose_endpoint = chain.chain_client().firehose_endpoint()?;
 
         let mapper = Arc::new(Mapper {});
 
@@ -54,12 +52,12 @@ impl BlockStreamBuilderTrait<Chain> for BlockStreamBuilder {
         Ok(Box::new(SubstreamsBlockStream::new(
             deployment.hash,
             firehose_endpoint,
-            None,
+            subgraph_current_block,
             block_cursor.as_ref().clone(),
             mapper,
             filter.modules.clone(),
             filter.module_name.clone(),
-            filter.start_block.map(|x| vec![x]).unwrap_or(vec![]),
+            filter.start_block.map(|x| vec![x]).unwrap_or_default(),
             vec![],
             logger,
             chain.metrics_registry.clone(),
@@ -68,7 +66,7 @@ impl BlockStreamBuilderTrait<Chain> for BlockStreamBuilder {
 
     async fn build_polling(
         &self,
-        _chain: Arc<Chain>,
+        _chain: &Chain,
         _deployment: DeploymentLocator,
         _start_blocks: Vec<BlockNumber>,
         _subgraph_current_block: Option<BlockPtr>,

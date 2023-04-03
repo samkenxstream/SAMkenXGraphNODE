@@ -1,17 +1,19 @@
 use graph::blockchain::block_stream::FirehoseCursor;
+use graph_store_postgres::command_support::OnSync;
 use lazy_static::lazy_static;
 use std::{marker::PhantomData, str::FromStr};
 use test_store::*;
 
 use graph::components::store::{
     DeploymentLocator, EntityKey, EntityOrder, EntityQuery, EntityType, PruneReporter,
+    PruneRequest, PruningStrategy, VersionStats,
 };
 use graph::data::store::scalar;
 use graph::data::subgraph::schema::*;
 use graph::data::subgraph::*;
 use graph::prelude::*;
 use graph::semver::Version;
-use graph_store_postgres::SubgraphStore as DieselSubgraphStore;
+use graph_store_postgres::{Shard, SubgraphStore as DieselSubgraphStore};
 
 const USER_GQL: &str = "
 enum Color { yellow, red, blue, green }
@@ -166,7 +168,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Johnton",
         "tonofjohn@email.com",
-        67 as i32,
+        67_i32,
         184.4,
         false,
         None,
@@ -180,7 +182,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Cindini",
         "dinici@email.com",
-        43 as i32,
+        43_i32,
         159.1,
         true,
         Some("red"),
@@ -190,7 +192,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Shaqueeena",
         "queensha@email.com",
-        28 as i32,
+        28_i32,
         111.7,
         false,
         Some("blue"),
@@ -209,7 +211,7 @@ async fn insert_test_data(store: Arc<DieselSubgraphStore>) -> DeploymentLocator 
         USER,
         "Shaqueeena",
         "teeko@email.com",
-        28 as i32,
+        28_i32,
         111.7,
         false,
         None,
@@ -259,10 +261,7 @@ fn create_test_entity(
     );
 
     EntityOperation::Set {
-        key: EntityKey {
-            entity_type: EntityType::new(entity_type.to_string()),
-            entity_id: id.into(),
-        },
+        key: EntityKey::data(entity_type.to_string(), id),
         data: test_entity,
     }
 }
@@ -319,16 +318,13 @@ async fn check_graft(
 
     // Make sure we caught Shaqueeena at block 1, before the change in
     // email address
-    let mut shaq = entities.first().unwrap().to_owned();
+    let mut shaq = entities.first().unwrap().clone();
     assert_eq!(Some(&Value::from("queensha@email.com")), shaq.get("email"));
 
     // Make our own entries for block 2
     shaq.set("email", "shaq@gmail.com");
     let op = EntityOperation::Set {
-        key: EntityKey {
-            entity_type: EntityType::new(USER.to_owned()),
-            entity_id: "3".into(),
-        },
+        key: EntityKey::data(USER.to_owned(), "3"),
         data: shaq,
     };
     transact_and_wait(&store, &deployment, BLOCKS[2].clone(), vec![op])
@@ -406,10 +402,29 @@ fn graft() {
 
         let (entities, ids) = find_entities(store.as_ref(), &deployment);
         assert_eq!(vec!["1"], ids);
-        let shaq = entities.first().unwrap().to_owned();
+        let shaq = entities.first().unwrap().clone();
         assert_eq!(Some(&Value::from("tonofjohn@email.com")), shaq.get("email"));
         Ok(())
     })
+}
+
+fn other_shard(
+    store: &DieselSubgraphStore,
+    src: &DeploymentLocator,
+) -> Result<Option<Shard>, StoreError> {
+    let src_shard = store.shard(src)?;
+
+    match all_shards()
+        .into_iter()
+        .find(|shard| shard.as_str() != src_shard.as_str())
+    {
+        None => {
+            // The tests are configured with just one shard, copying is not possible
+            println!("skipping copy test since there is no shard to copy to");
+            Ok(None)
+        }
+        Some(shard) => Ok(Some(shard)),
+    }
 }
 
 // This test will only do something if the test configuration uses at least
@@ -417,41 +432,119 @@ fn graft() {
 #[test]
 fn copy() {
     run_test(|store, src| async move {
-        let src_shard = store.shard(&src)?;
+        if let Some(dst_shard) = other_shard(&store, &src)? {
+            let deployment = store.copy_deployment(
+                &src,
+                dst_shard,
+                NODE_ID.clone(),
+                BLOCKS[1].clone(),
+                OnSync::None,
+            )?;
 
-        let dst_shard = match all_shards()
-            .into_iter()
-            .find(|shard| shard.as_str() != src_shard.as_str())
-        {
-            None => {
-                // The tests are configured with just one shard, copying is not possible
-                println!("skipping copy test since there is no shard to copy to");
-                return Ok(());
+            store
+                .cheap_clone()
+                .writable(LOGGER.clone(), deployment.id)
+                .await?
+                .start_subgraph_deployment(&LOGGER)
+                .await?;
+
+            store.activate(&deployment)?;
+
+            check_graft(store, deployment).await?;
+        }
+        Ok(())
+    })
+}
+
+// Test that the on_sync behavior is correct when `deployment_synced` gets
+// run. This test will only do something if the test configuration uses at
+// least two shards
+#[test]
+fn on_sync() {
+    for on_sync in [OnSync::None, OnSync::Activate, OnSync::Replace] {
+        run_test(move |store, src| async move {
+            if let Some(dst_shard) = other_shard(&store, &src)? {
+                let dst = store.copy_deployment(
+                    &src,
+                    dst_shard,
+                    NODE_ID.clone(),
+                    BLOCKS[1].clone(),
+                    on_sync,
+                )?;
+
+                let writable = store.cheap_clone().writable(LOGGER.clone(), dst.id).await?;
+
+                writable.start_subgraph_deployment(&LOGGER).await?;
+                writable.deployment_synced()?;
+
+                let primary = primary_connection();
+                let src_site = primary.locate_site(src)?.unwrap();
+                let src_node = primary.assigned_node(&src_site)?;
+                let dst_site = primary.locate_site(dst)?.unwrap();
+                let dst_node = primary.assigned_node(&dst_site)?;
+
+                assert!(dst_node.is_some());
+                match on_sync {
+                    OnSync::None => {
+                        assert!(src_node.is_some());
+                        assert!(src_site.active);
+                        assert!(!dst_site.active)
+                    }
+                    OnSync::Activate => {
+                        assert!(src_node.is_some());
+                        assert!(!src_site.active);
+                        assert!(dst_site.active)
+                    }
+                    OnSync::Replace => {
+                        assert!(src_node.is_none());
+                        assert!(!src_site.active);
+                        assert!(dst_site.active)
+                    }
+                }
             }
-            Some(shard) => shard,
-        };
+            Ok(())
+        })
+    }
 
-        let deployment =
-            store.copy_deployment(&src, dst_shard, NODE_ID.clone(), BLOCKS[1].clone())?;
+    // Check that on_sync does not cause an error when the source of the
+    // copy has vanished
+    run_test(move |store, src| async move {
+        if let Some(dst_shard) = other_shard(&store, &src)? {
+            let dst = store.copy_deployment(
+                &src,
+                dst_shard,
+                NODE_ID.clone(),
+                BLOCKS[1].clone(),
+                OnSync::Replace,
+            )?;
 
-        store
-            .cheap_clone()
-            .writable(LOGGER.clone(), deployment.id)
-            .await?
-            .start_subgraph_deployment(&*LOGGER)
-            .await?;
+            let writable = store.cheap_clone().writable(LOGGER.clone(), dst.id).await?;
 
-        store.activate(&deployment)?;
+            // Perform the copy
+            writable.start_subgraph_deployment(&LOGGER).await?;
 
-        check_graft(store, deployment).await
+            let primary = primary_connection();
+            let src_site = primary.locate_site(src.clone())?.unwrap();
+            primary.unassign_subgraph(&src_site)?;
+            store.activate(&dst)?;
+            store.remove_deployment(src.id.into())?;
+
+            let res = writable.deployment_synced();
+            assert!(res.is_ok());
+        }
+        Ok(())
     })
 }
 
 #[test]
 fn prune() {
+    struct Progress;
+    impl PruneReporter for Progress {}
+
     fn check_at_block(
         store: &DieselSubgraphStore,
         src: &DeploymentLocator,
+        strategy: PruningStrategy,
         block: BlockNumber,
         exp: Vec<&str>,
     ) {
@@ -470,75 +563,91 @@ fn prune() {
             .into_iter()
             .map(|entity| entity.id().unwrap())
             .collect();
-        assert_eq!(act, exp);
-    }
-
-    async fn prune(
-        store: &DieselSubgraphStore,
-        src: &DeploymentLocator,
-        earliest_block: BlockNumber,
-    ) -> Result<(), StoreError> {
-        struct Progress;
-        impl PruneReporter for Progress {}
-        let reporter = Box::new(Progress);
-
-        store
-            .prune(reporter, &src, earliest_block, 1, 1.1)
-            .await
-            .map(|_| ())
-    }
-
-    run_test(|store, src| async move {
-        // The setup sets the subgraph pointer to block 2, we try to set
-        // earliest block to 5
-        prune(&store, &src, 5)
-            .await
-            .expect_err("setting earliest block later than latest does not work");
-
-        // Latest block 2 minus reorg threshold 1 means we need to copy
-        // final blocks from block 1, but want earliest as block 2, i.e. no
-        // final blocks which won't work
-        prune(&store, &src, 2)
-            .await
-            .expect_err("setting earliest block after last final block fails");
-
-        // Add another version for user 2 at block 4
-        let user2 = create_test_entity(
-            "2",
-            USER,
-            "Cindini",
-            "dinici@email.com",
-            44 as i32,
-            157.1,
-            true,
-            Some("red"),
+        assert_eq!(
+            act, exp,
+            "different users visible at block {block} with {strategy}"
         );
-        transact_and_wait(&store, &src, BLOCKS[5].clone(), vec![user2])
-            .await
-            .unwrap();
+    }
 
-        // Setup and the above addition create these user versions:
-        // id | versions
-        // ---+---------
-        //  1 | [0,)
-        //  2 | [1,5) [5,)
-        //  3 | [1,2) [2,)
+    for strategy in [PruningStrategy::Rebuild, PruningStrategy::Delete] {
+        run_test(move |store, src| async move {
+            store
+                .set_history_blocks(&src, -3, 10)
+                .expect_err("history_blocks can not be set to a negative number");
 
-        // Forward block ptr to block 5
-        transact_and_wait(&store, &src, BLOCKS[6].clone(), vec![])
-            .await
-            .unwrap();
-        // Pruning only removes the [1,2) version of user 3
-        prune(&store, &src, 3).await.expect("pruning works");
+            store
+                .set_history_blocks(&src, 10, 10)
+                .expect_err("history_blocks must be bigger than reorg_threshold");
 
-        // Check which versions exist at every block, even if they are
-        // before the new earliest block, since we don't have a convenient
-        // way to load all entity versions with their block range
-        check_at_block(&store, &src, 0, vec!["1"]);
-        check_at_block(&store, &src, 1, vec!["1", "2"]);
-        for block in 2..=5 {
-            check_at_block(&store, &src, block, vec!["1", "2", "3"]);
-        }
-        Ok(())
-    })
+            // Add another version for user 2 at block 4
+            let user2 = create_test_entity(
+                "2",
+                USER,
+                "Cindini",
+                "dinici@email.com",
+                44_i32,
+                157.1,
+                true,
+                Some("red"),
+            );
+            transact_and_wait(&store, &src, BLOCKS[5].clone(), vec![user2])
+                .await
+                .unwrap();
+
+            // Setup and the above addition create these user versions:
+            // id | versions
+            // ---+---------
+            //  1 | [0,)
+            //  2 | [1,5) [5,)
+            //  3 | [1,2) [2,)
+
+            // Forward block ptr to block 6
+            transact_and_wait(&store, &src, BLOCKS[6].clone(), vec![])
+                .await
+                .unwrap();
+
+            // Prune to 3 blocks of history, with a reorg threshold of 1 where
+            // we have blocks from [0, 6]. That should only remove the [1,2)
+            // version of user 3
+            let mut req = PruneRequest::new(&src, 3, 1, 0, 6)?;
+            // Change the thresholds so that we select the desired strategy
+            match strategy {
+                PruningStrategy::Rebuild => {
+                    req.rebuild_threshold = 0.0;
+                    req.delete_threshold = 0.0;
+                }
+                PruningStrategy::Delete => {
+                    req.rebuild_threshold = 1.0;
+                    req.delete_threshold = 0.0;
+                }
+            }
+            // We have 5 versions for 3 entities
+            let stats = VersionStats {
+                entities: 3,
+                versions: 5,
+                tablename: USER.to_ascii_lowercase(),
+                ratio: 3.0 / 5.0,
+                last_pruned_block: None,
+            };
+            assert_eq!(
+                Some(strategy),
+                req.strategy(&stats),
+                "changing thresholds didn't yield desired strategy"
+            );
+            store
+                .prune(Box::new(Progress), &src, req)
+                .await
+                .expect("pruning works");
+
+            // Check which versions exist at every block, even if they are
+            // before the new earliest block, since we don't have a convenient
+            // way to load all entity versions with their block range
+            check_at_block(&store, &src, strategy, 0, vec!["1"]);
+            check_at_block(&store, &src, strategy, 1, vec!["1", "2"]);
+            for block in 2..=5 {
+                check_at_block(&store, &src, strategy, block, vec!["1", "2", "3"]);
+            }
+            Ok(())
+        })
+    }
 }

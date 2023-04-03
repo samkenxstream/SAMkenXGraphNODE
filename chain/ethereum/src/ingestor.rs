@@ -1,70 +1,40 @@
 use crate::{chain::BlockFinality, EthereumAdapter, EthereumAdapterTrait, ENV_VARS};
 use graph::{
-    blockchain::{BlockHash, BlockPtr, IngestorError},
+    blockchain::{BlockHash, BlockIngestor, BlockPtr, IngestorError},
     cheap_clone::CheapClone,
     prelude::{
-        error, ethabi::ethereum_types::H256, info, tokio, trace, warn, ChainStore, Error,
-        EthereumBlockWithCalls, Future01CompatExt, LogCode, Logger,
+        async_trait, error, ethabi::ethereum_types::H256, info, tokio, trace, warn, ChainStore,
+        Error, EthereumBlockWithCalls, Future01CompatExt, LogCode, Logger,
     },
 };
 use std::{sync::Arc, time::Duration};
 
-pub struct BlockIngestor {
+pub struct PollingBlockIngestor {
     logger: Logger,
     ancestor_count: i32,
     eth_adapter: Arc<EthereumAdapter>,
     chain_store: Arc<dyn ChainStore>,
     polling_interval: Duration,
+    network_name: String,
 }
 
-impl BlockIngestor {
+impl PollingBlockIngestor {
     pub fn new(
         logger: Logger,
         ancestor_count: i32,
         eth_adapter: Arc<EthereumAdapter>,
         chain_store: Arc<dyn ChainStore>,
         polling_interval: Duration,
-    ) -> Result<BlockIngestor, Error> {
-        Ok(BlockIngestor {
+        network_name: String,
+    ) -> Result<PollingBlockIngestor, Error> {
+        Ok(PollingBlockIngestor {
             logger,
             ancestor_count,
             eth_adapter,
             chain_store,
             polling_interval,
+            network_name,
         })
-    }
-
-    pub async fn into_polling_stream(self) {
-        loop {
-            match self.do_poll().await {
-                // Some polls will fail due to transient issues
-                Err(err @ IngestorError::BlockUnavailable(_)) => {
-                    info!(
-                        self.logger,
-                        "Trying again after block polling failed: {}", err
-                    );
-                }
-                Err(err @ IngestorError::ReceiptUnavailable(_, _)) => {
-                    info!(
-                        self.logger,
-                        "Trying again after block polling failed: {}", err
-                    );
-                }
-                Err(IngestorError::Unknown(inner_err)) => {
-                    warn!(
-                        self.logger,
-                        "Trying again after block polling failed: {}", inner_err
-                    );
-                }
-                Ok(()) => (),
-            }
-
-            if ENV_VARS.cleanup_blocks {
-                self.cleanup_cached_blocks()
-            }
-
-            tokio::time::sleep(self.polling_interval).await;
-        }
     }
 
     fn cleanup_cached_blocks(&self) {
@@ -99,9 +69,22 @@ impl BlockIngestor {
         // block, as we expect the poll interval to be much shorter than the block time.
         let latest_block = self.latest_block().await?;
 
-        // If latest block matches head block in store, nothing needs to be done
-        if Some(&latest_block) == head_block_ptr_opt.as_ref() {
-            return Ok(());
+        if let Some(head_block) = head_block_ptr_opt.as_ref() {
+            // If latest block matches head block in store, nothing needs to be done
+            if &latest_block == head_block {
+                return Ok(());
+            }
+
+            if latest_block.number < head_block.number {
+                // An ingestor might wait or move forward, but it never
+                // wavers and goes back. More seriously, this keeps us from
+                // later trying to ingest a block with the same number again
+                warn!(self.logger,
+                    "Provider went backwards - ignoring this latest block";
+                    "current_block_head" => head_block.number,
+                    "latest_block_head" => latest_block.number);
+                return Ok(());
+            }
         }
 
         // Compare latest block with head ptr, alert user if far behind
@@ -180,7 +163,7 @@ impl BlockIngestor {
             .block_by_hash(&self.logger, block_hash)
             .compat()
             .await?
-            .ok_or_else(|| IngestorError::BlockUnavailable(block_hash))?;
+            .ok_or(IngestorError::BlockUnavailable(block_hash))?;
         let ethereum_block = self
             .eth_adapter
             .load_full_block(&self.logger, block)
@@ -215,5 +198,33 @@ impl BlockIngestor {
             .compat()
             .await
             .map(|block| block.into())
+    }
+}
+
+#[async_trait]
+impl BlockIngestor for PollingBlockIngestor {
+    async fn run(self: Box<Self>) {
+        loop {
+            match self.do_poll().await {
+                // Some polls will fail due to transient issues
+                Err(err) => {
+                    error!(
+                        self.logger,
+                        "Trying again after block polling failed: {}", err
+                    );
+                }
+                Ok(()) => (),
+            }
+
+            if ENV_VARS.cleanup_blocks {
+                self.cleanup_cached_blocks()
+            }
+
+            tokio::time::sleep(self.polling_interval).await;
+        }
+    }
+
+    fn network_name(&self) -> String {
+        self.network_name.clone()
     }
 }

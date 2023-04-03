@@ -9,11 +9,13 @@ use wasmtime::Trap;
 use web3::types::H160;
 
 use graph::blockchain::Blockchain;
-use graph::components::store::EnsLookup;
+use graph::components::store::{EnsLookup, LoadRelatedRequest};
 use graph::components::store::{EntityKey, EntityType};
-use graph::components::subgraph::{CausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing};
+use graph::components::subgraph::{
+    PoICausalityRegion, ProofOfIndexingEvent, SharedProofOfIndexing,
+};
 use graph::data::store;
-use graph::data_source::{DataSource, DataSourceTemplate};
+use graph::data_source::{CausalityRegion, DataSource, DataSourceTemplate, EntityTypeAccess};
 use graph::ensure;
 use graph::prelude::ethabi::param_type::Reader;
 use graph::prelude::ethabi::{decode, encode, Token};
@@ -59,13 +61,16 @@ pub struct HostExports<C: Blockchain> {
     pub api_version: Version,
     data_source_name: String,
     data_source_address: Vec<u8>,
-    data_source_network: String,
+    subgraph_network: String,
     data_source_context: Arc<Option<DataSourceContext>>,
+    entity_type_access: EntityTypeAccess,
+    data_source_causality_region: CausalityRegion,
+
     /// Some data sources have indeterminism or different notions of time. These
     /// need to be each be stored separately to separate causality between them,
     /// and merge the results later. Right now, this is just the ethereum
     /// networks but will be expanded for ipfs and the availability chain.
-    causality_region: String,
+    poi_causality_region: String,
     templates: Arc<Vec<DataSourceTemplate<C>>>,
     pub(crate) link_resolver: Arc<dyn LinkResolver>,
     ens_lookup: Arc<dyn EnsLookup>,
@@ -75,7 +80,7 @@ impl<C: Blockchain> HostExports<C> {
     pub fn new(
         subgraph_id: DeploymentHash,
         data_source: &DataSource<C>,
-        data_source_network: String,
+        subgraph_network: String,
         templates: Arc<Vec<DataSourceTemplate<C>>>,
         link_resolver: Arc<dyn LinkResolver>,
         ens_lookup: Arc<dyn EnsLookup>,
@@ -86,11 +91,28 @@ impl<C: Blockchain> HostExports<C> {
             data_source_name: data_source.name().to_owned(),
             data_source_address: data_source.address().unwrap_or_default(),
             data_source_context: data_source.context().cheap_clone(),
-            causality_region: CausalityRegion::from_network(&data_source_network),
-            data_source_network,
+            entity_type_access: data_source.entities(),
+            data_source_causality_region: data_source.causality_region(),
+            poi_causality_region: PoICausalityRegion::from_network(&subgraph_network),
+            subgraph_network,
             templates,
             link_resolver,
             ens_lookup,
+        }
+    }
+
+    /// Enfore the entity type access restrictions. See also: entity-type-access
+    fn check_entity_type_access(&self, entity_type: &EntityType) -> Result<(), HostExportError> {
+        match self.entity_type_access.allows(entity_type) {
+            true => Ok(()),
+            false => Err(HostExportError::Deterministic(anyhow!(
+                "entity type `{}` is not on the 'entities' list for data source `{}`. \
+                 Hint: Add `{}` to the 'entities' list, which currently is: `{}`.",
+                entity_type,
+                self.data_source_name,
+                entity_type,
+                self.entity_type_access
+            ))),
         }
     }
 
@@ -136,7 +158,7 @@ impl<C: Blockchain> HostExports<C> {
         data: HashMap<String, Value>,
         stopwatch: &StopwatchMetrics,
         gas: &GasCounter,
-    ) -> Result<(), anyhow::Error> {
+    ) -> Result<(), HostExportError> {
         let poi_section = stopwatch.start_section("host_export_store_set__proof_of_indexing");
         write_poi_event(
             proof_of_indexing,
@@ -145,7 +167,7 @@ impl<C: Blockchain> HostExports<C> {
                 id: &entity_id,
                 data: &data,
             },
-            &self.causality_region,
+            &self.poi_causality_region,
             logger,
         );
         poi_section.end();
@@ -153,12 +175,14 @@ impl<C: Blockchain> HostExports<C> {
         let key = EntityKey {
             entity_type: EntityType::new(entity_type),
             entity_id: entity_id.into(),
+            causality_region: self.data_source_causality_region,
         };
+        self.check_entity_type_access(&key.entity_type)?;
 
         gas.consume_host_fn(gas::STORE_SET.with_args(complexity::Linear, (&key, &data)))?;
 
         let entity = Entity::from(data);
-        state.entity_cache.set(key.clone(), entity)?;
+        state.entity_cache.set(key, entity)?;
 
         Ok(())
     }
@@ -178,13 +202,15 @@ impl<C: Blockchain> HostExports<C> {
                 entity_type: &entity_type,
                 id: &entity_id,
             },
-            &self.causality_region,
+            &self.poi_causality_region,
             logger,
         );
         let key = EntityKey {
             entity_type: EntityType::new(entity_type),
             entity_id: entity_id.into(),
+            causality_region: self.data_source_causality_region,
         };
+        self.check_entity_type_access(&key.entity_type)?;
 
         gas.consume_host_fn(gas::STORE_REMOVE.with_args(complexity::Size, &key))?;
 
@@ -203,9 +229,33 @@ impl<C: Blockchain> HostExports<C> {
         let store_key = EntityKey {
             entity_type: EntityType::new(entity_type),
             entity_id: entity_id.into(),
+            causality_region: self.data_source_causality_region,
         };
+        self.check_entity_type_access(&store_key.entity_type)?;
 
         let result = state.entity_cache.get(&store_key)?;
+        gas.consume_host_fn(gas::STORE_GET.with_args(complexity::Linear, (&store_key, &result)))?;
+
+        Ok(result)
+    }
+
+    pub(crate) fn store_load_related(
+        &self,
+        state: &mut BlockState<C>,
+        entity_type: String,
+        entity_id: String,
+        entity_field: String,
+        gas: &GasCounter,
+    ) -> Result<Vec<Entity>, anyhow::Error> {
+        let store_key = LoadRelatedRequest {
+            entity_type: EntityType::new(entity_type),
+            entity_id: entity_id.into(),
+            entity_field: entity_field.into(),
+            causality_region: self.data_source_causality_region,
+        };
+        self.check_entity_type_access(&store_key.entity_type)?;
+
+        let result = state.entity_cache.load_related(&store_key)?;
         gas.consume_host_fn(gas::STORE_GET.with_args(complexity::Linear, (&store_key, &result)))?;
 
         Ok(result)
@@ -573,7 +623,7 @@ impl<C: Blockchain> HostExports<C> {
         x: BigDecimal,
         y: BigDecimal,
         gas: &GasCounter,
-    ) -> Result<bool, DeterministicHostError> {
+    ) -> Result<bool, HostExportError> {
         gas.consume_host_fn(gas::BIG_MATH_GAS_OP.with_args(complexity::Min, (&x, &y)))?;
         Ok(x == y)
     }
@@ -653,6 +703,10 @@ impl<C: Blockchain> HostExports<C> {
         Ok(self.ens_lookup.find_name(hash)?)
     }
 
+    pub(crate) fn is_ens_data_empty(&self) -> Result<bool, anyhow::Error> {
+        Ok(self.ens_lookup.is_table_empty()?)
+    }
+
     pub(crate) fn log_log(
         &self,
         logger: &Logger,
@@ -691,7 +745,7 @@ impl<C: Blockchain> HostExports<C> {
         gas: &GasCounter,
     ) -> Result<String, DeterministicHostError> {
         gas.consume_host_fn(Gas::new(gas::DEFAULT_BASE_COST))?;
-        Ok(self.data_source_network.clone())
+        Ok(self.subgraph_network.clone())
     }
 
     pub(crate) fn data_source_context(

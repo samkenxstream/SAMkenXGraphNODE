@@ -28,6 +28,8 @@ pub mod firehose;
 
 pub mod substreams;
 
+pub mod endpoint;
+
 /// Helpers for parsing environment variables.
 pub mod env;
 
@@ -75,9 +77,11 @@ pub mod prelude {
     pub use futures03::sink::SinkExt as _;
     pub use futures03::stream::{StreamExt as _, TryStreamExt};
     pub use hex;
+    pub use isatty;
     pub use lazy_static::lazy_static;
     pub use prost;
     pub use rand;
+    pub use regex;
     pub use reqwest;
     pub use serde;
     pub use serde_derive::{Deserialize, Serialize};
@@ -110,21 +114,20 @@ pub mod prelude {
     };
     pub use crate::components::link_resolver::{JsonStreamValue, JsonValueStream, LinkResolver};
     pub use crate::components::metrics::{
-        aggregate::Aggregate, stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter,
-        CounterVec, Gauge, GaugeVec, Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts,
-        PrometheusError, Registry,
+        stopwatch::StopwatchMetrics, subgraph::*, Collector, Counter, CounterVec, Gauge, GaugeVec,
+        Histogram, HistogramOpts, HistogramVec, MetricsRegistry, Opts, PrometheusError, Registry,
     };
     pub use crate::components::server::index_node::IndexNodeServer;
-    pub use crate::components::server::metrics::MetricsServer;
     pub use crate::components::server::query::GraphQLServer;
     pub use crate::components::server::subscription::SubscriptionServer;
     pub use crate::components::store::{
         AttributeNames, BlockNumber, CachedEthereumCall, ChainStore, Child, ChildMultiplicity,
         EntityCache, EntityChange, EntityChangeOperation, EntityCollection, EntityFilter,
-        EntityLink, EntityModification, EntityOperation, EntityOrder, EntityQuery, EntityRange,
-        EntityWindow, EthereumCallCache, ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore,
-        QueryStoreManager, StoreError, StoreEvent, StoreEventStream, StoreEventStreamBox,
-        SubgraphStore, UnfailOutcome, WindowAttribute, BLOCK_NUMBER_MAX,
+        EntityLink, EntityModification, EntityOperation, EntityOrder, EntityOrderByChild,
+        EntityOrderByChildInfo, EntityQuery, EntityRange, EntityWindow, EthereumCallCache,
+        ParentLink, PartialBlockPtr, PoolWaitStats, QueryStore, QueryStoreManager, StoreError,
+        StoreEvent, StoreEventStream, StoreEventStreamBox, SubgraphStore, UnfailOutcome,
+        WindowAttribute, BLOCK_NUMBER_MAX,
     };
     pub use crate::components::subgraph::{
         BlockState, DataSourceTemplateInfo, HostMetrics, RuntimeHost, RuntimeHostBuilder,

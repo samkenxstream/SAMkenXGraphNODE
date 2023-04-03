@@ -1,14 +1,18 @@
+use prometheus::Counter;
+
 use crate::blockchain::block_stream::BlockStreamMetrics;
-use crate::prelude::{Gauge, Histogram, HostMetrics, MetricsRegistry};
+use crate::prelude::{Gauge, Histogram, HostMetrics};
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::stopwatch::StopwatchMetrics;
+use super::MetricsRegistry;
 
 pub struct SubgraphInstanceMetrics {
     pub block_trigger_count: Box<Histogram>,
     pub block_processing_duration: Box<Histogram>,
     pub block_ops_transaction_duration: Box<Histogram>,
+    pub firehose_connection_errors: Counter,
 
     pub stopwatch: StopwatchMetrics,
     trigger_processing_duration: Box<Histogram>,
@@ -16,7 +20,7 @@ pub struct SubgraphInstanceMetrics {
 
 impl SubgraphInstanceMetrics {
     pub fn new(
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         subgraph_hash: &str,
         stopwatch: StopwatchMetrics,
     ) -> Self {
@@ -53,11 +57,20 @@ impl SubgraphInstanceMetrics {
             )
             .expect("failed to create `deployment_transact_block_operations_duration_{}");
 
+        let firehose_connection_errors = registry
+            .new_deployment_counter(
+                "firehose_connection_errors",
+                "Measures connections when trying to obtain a firehose connection",
+                subgraph_hash,
+            )
+            .expect("failed to create firehose_connection_errors counter");
+
         Self {
             block_trigger_count,
             block_processing_duration,
             trigger_processing_duration,
             block_ops_transaction_duration,
+            firehose_connection_errors,
             stopwatch,
         }
     }
@@ -66,7 +79,7 @@ impl SubgraphInstanceMetrics {
         self.trigger_processing_duration.observe(duration);
     }
 
-    pub fn unregister(&self, registry: Arc<dyn MetricsRegistry>) {
+    pub fn unregister(&self, registry: Arc<MetricsRegistry>) {
         registry.unregister(self.block_processing_duration.clone());
         registry.unregister(self.block_trigger_count.clone());
         registry.unregister(self.trigger_processing_duration.clone());
@@ -74,20 +87,32 @@ impl SubgraphInstanceMetrics {
     }
 }
 
-pub struct SubgraphInstanceManagerMetrics {
-    pub subgraph_count: Box<Gauge>,
+#[derive(Debug)]
+pub struct SubgraphCountMetric {
+    pub running_count: Box<Gauge>,
+    pub deployment_count: Box<Gauge>,
 }
 
-impl SubgraphInstanceManagerMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
-        let subgraph_count = registry
+impl SubgraphCountMetric {
+    pub fn new(registry: Arc<MetricsRegistry>) -> Self {
+        let running_count = registry
             .new_gauge(
-                "deployment_count",
+                "deployment_running_count",
                 "Counts the number of deployments currently being indexed by the graph-node.",
                 HashMap::new(),
             )
             .expect("failed to create `deployment_count` gauge");
-        Self { subgraph_count }
+        let deployment_count = registry
+            .new_gauge(
+                "deployment_count",
+                "Counts the number of deployments currently deployed to the graph-node.",
+                HashMap::new(),
+            )
+            .expect("failed to create `deployment_count` gauge");
+        Self {
+            running_count,
+            deployment_count,
+        }
     }
 }
 

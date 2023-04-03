@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use graph::blockchain::Blockchain;
+use graph::blockchain::{Block, Blockchain};
 use graph::cheap_clone::CheapClone;
 use graph::components::store::SubgraphFork;
 use graph::components::subgraph::{MappingError, SharedProofOfIndexing};
@@ -30,6 +30,7 @@ where
         causality_region: &str,
         debug_fork: &Option<Arc<dyn SubgraphFork>>,
         subgraph_metrics: &Arc<SubgraphInstanceMetrics>,
+        instrument: bool,
     ) -> Result<BlockState<C>, MappingError> {
         let error_count = state.deterministic_errors.len();
 
@@ -47,7 +48,7 @@ where
                     None => continue,
                 };
 
-                host_mapping.push((&host, mapping_trigger));
+                host_mapping.push((host, mapping_trigger));
             }
         }
 
@@ -71,16 +72,18 @@ where
                     state,
                     proof_of_indexing.cheap_clone(),
                     debug_fork,
+                    instrument,
                 )
                 .await?;
             let elapsed = start.elapsed().as_secs_f64();
             subgraph_metrics.observe_trigger_processing_duration(elapsed);
 
-            if host.data_source().as_offchain().is_some() {
+            if let Some(ds) = host.data_source().as_offchain() {
+                ds.mark_processed_at(block.number());
                 // Remove this offchain data source since it has just been processed.
                 state
-                    .offchain_to_remove
-                    .push(host.data_source().as_stored_dynamic_data_source());
+                    .processed_data_sources
+                    .push(ds.as_stored_dynamic_data_source());
             }
         }
 
@@ -92,7 +95,7 @@ where
                 // ProofOfIndexingEvent::DeterministicError to the SharedProofOfIndexing.
                 proof_of_indexing
                     .borrow_mut()
-                    .write_deterministic_error(&logger, causality_region);
+                    .write_deterministic_error(logger, causality_region);
             }
         }
 

@@ -115,6 +115,8 @@ pub fn mock_context(
         proof_of_indexing: None,
         host_fns: Arc::new(Vec::new()),
         debug_fork: None,
+        mapping_logger: Logger::root(slog::Discard, o!()),
+        instrument: false,
     }
 }
 
@@ -140,7 +142,7 @@ pub fn mock_data_source(path: &str, api_version: Version) -> DataSource {
             link: Link {
                 link: "link".to_owned(),
             },
-            runtime: Arc::new(runtime.clone()),
+            runtime: Arc::new(runtime),
         },
         context: Default::default(),
         creation_block: None,

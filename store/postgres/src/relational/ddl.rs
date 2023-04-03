@@ -5,12 +5,20 @@ use std::{
 
 use graph::prelude::BLOCK_NUMBER_MAX;
 
+use crate::block_range::CAUSALITY_REGION_COLUMN;
 use crate::relational::{
-    Catalog, ColumnType, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE,
-    STRING_PREFIX_SIZE, VID_COLUMN,
+    ColumnType, BLOCK_COLUMN, BLOCK_RANGE_COLUMN, BYTE_ARRAY_PREFIX_SIZE, STRING_PREFIX_SIZE,
+    VID_COLUMN,
 };
 
 use super::{Column, Layout, SqlName, Table};
+
+// In debug builds (for testing etc.) unconditionally create exclusion constraints, in release
+// builds for production, skip them
+#[cfg(debug_assertions)]
+const CREATE_EXCLUSION_CONSTRAINT: bool = true;
+#[cfg(not(debug_assertions))]
+const CREATE_EXCLUSION_CONSTRAINT: bool = false;
 
 impl Layout {
     /// Generate the DDL for the entire layout, i.e., all `create table`
@@ -30,7 +38,7 @@ impl Layout {
         tables.sort_by_key(|table| table.position);
         // Output 'create table' statements for all tables
         for table in tables {
-            table.as_ddl(&mut out, self)?;
+            table.as_ddl(&mut out)?;
         }
 
         Ok(out)
@@ -73,36 +81,43 @@ impl Table {
     }
 
     // Changes to this function require changing `column_names`, too
-    pub(crate) fn create_table(&self, out: &mut String, layout: &Layout) -> fmt::Result {
+    pub(crate) fn create_table(&self, out: &mut String) -> fmt::Result {
         fn columns_ddl(table: &Table) -> Result<String, fmt::Error> {
             let mut cols = String::new();
             let mut first = true;
+
+            if table.has_causality_region {
+                first = false;
+                write!(
+                    cols,
+                    "{causality_region}     int not null",
+                    causality_region = CAUSALITY_REGION_COLUMN
+                )?;
+            }
+
             for column in &table.columns {
                 if !first {
                     writeln!(cols, ",")?;
-                } else {
-                    writeln!(cols)?;
+                    write!(cols, "        ")?;
                 }
-                write!(cols, "    ")?;
                 column.as_ddl(&mut cols)?;
                 first = false;
             }
+
             Ok(cols)
         }
 
         if self.immutable {
             writeln!(
                 out,
-                r#"
-            create table {nsp}.{name} (
-                {vid}                  bigserial primary key,
-                {block}                int not null,
-                {cols},
-                unique({id})
-            );
-            "#,
-                nsp = layout.catalog.site.namespace,
-                name = self.name.quoted(),
+                "
+    create table {qname} (
+        {vid}                  bigserial primary key,
+        {block}                int not null,\n\
+        {cols},
+        unique({id})
+    );",
+                qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
                 block = BLOCK_COLUMN,
@@ -112,100 +127,30 @@ impl Table {
             writeln!(
                 out,
                 r#"
-            create table {nsp}.{name} (
-                {vid}                  bigserial primary key,
-                {block_range}          int4range not null,
-                {cols}
-            );
-            "#,
-                nsp = layout.catalog.site.namespace,
-                name = self.name.quoted(),
+    create table {qname} (
+        {vid}                  bigserial primary key,
+        {block_range}          int4range not null,
+        {cols}
+    );"#,
+                qname = self.qualified_name,
                 cols = columns_ddl(self)?,
                 vid = VID_COLUMN,
                 block_range = BLOCK_RANGE_COLUMN
             )?;
 
-            self.exclusion_ddl(
-                out,
-                layout.catalog.site.namespace.as_str(),
-                Catalog::create_exclusion_constraint(),
-            )
+            self.exclusion_ddl(out)
         }
     }
 
-    /// Generate SQL that renames the table `from` to `to`. The code assumes
-    /// that `from` has been created with `create_table`, but that no other
-    /// indexes have been created on it, and also renames any indexes and
-    /// constraints, so that the database, after running the generated SQL,
-    /// will have the exact same table as if `from.create_sql` had been run
-    /// initially.
-    ///
-    /// The code does not do anything about the sequence for `vid`; it is
-    /// assumed that both `from` and `to` already use the same sequence for
-    /// that
-    ///
-    /// For mutable tables, if `has_exclusion_constraint` is true, assume
-    /// there is an exclusion constraint on `(id, block_range)`; if it is
-    /// false, assume there is a GIST index on those columns. For immutbale
-    /// tables, this argument has no effect. It is assumed that the name of
-    /// the constraint or index is what `create_table` uses for these.
-    pub(crate) fn rename_sql(
-        out: &mut String,
-        layout: &Layout,
-        from: &Table,
-        to: &Table,
-        has_exclusion_constraint: bool,
-    ) -> fmt::Result {
-        let nsp = layout.site.namespace.as_str();
-        let from_name = &from.name;
-        let to_name = &to.name;
-        let id = &to.primary_key().name;
-
-        writeln!(
-            out,
-            r#"alter table "{nsp}"."{from_name}" rename to "{to_name}";"#
-        )?;
-
-        writeln!(
-            out,
-            r#"alter table "{nsp}"."{to_name}" rename constraint "{from_name}_pkey" to "{to_name}_pkey";"#
-        )?;
-
-        if to.immutable {
-            writeln!(
-                out,
-                r#"alter table "{nsp}"."{to_name}" rename constraint "{from_name}_{id}_key" to "{to_name}_{id}_key";"#
-            )?;
-        } else {
-            if has_exclusion_constraint {
-                writeln!(
-                    out,
-                    r#"alter table "{nsp}"."{to_name}" rename constraint "{from_name}_{id}_{BLOCK_RANGE_COLUMN}_excl" to "{to_name}_{id}_{BLOCK_RANGE_COLUMN}_excl";"#
-                )?;
-            } else {
-                writeln!(
-                    out,
-                    r#"alter index "{nsp}"."{from_name}_{id}_{BLOCK_RANGE_COLUMN}_excl" rename to "{to_name}_{id}_{BLOCK_RANGE_COLUMN}_excl";"#
-                )?;
-            }
-        }
-
-        Ok(())
-    }
-
-    pub(crate) fn create_time_travel_indexes(
-        &self,
-        out: &mut String,
-        layout: &Layout,
-    ) -> fmt::Result {
+    fn create_time_travel_indexes(&self, out: &mut String) -> fmt::Result {
         if self.immutable {
             write!(
                 out,
                 "create index brin_{table_name}\n    \
-                on {schema_name}.{table_name}\n \
+                on {qname}\n \
                    using brin({block}, vid);\n",
                 table_name = self.name,
-                schema_name = layout.catalog.site.namespace,
+                qname = self.qualified_name,
                 block = BLOCK_COLUMN
             )
         } else {
@@ -231,10 +176,10 @@ impl Table {
             // We also index `vid` as that correlates with the order in which
             // entities are stored.
             write!(out,"create index brin_{table_name}\n    \
-                on {schema_name}.{table_name}\n \
+                on {qname}\n \
                    using brin(lower(block_range), coalesce(upper(block_range), {block_max}), vid);\n",
                 table_name = self.name,
-                schema_name = layout.catalog.site.namespace,
+                qname = self.qualified_name,
                 block_max = BLOCK_NUMBER_MAX)?;
 
             // Add a BTree index that helps with the `RevertClampQuery` by making
@@ -242,20 +187,16 @@ impl Table {
             write!(
                 out,
                 "create index {table_name}_block_range_closed\n    \
-                 on {schema_name}.{table_name}(coalesce(upper(block_range), {block_max}))\n \
+                 on {qname}(coalesce(upper(block_range), {block_max}))\n \
                  where coalesce(upper(block_range), {block_max}) < {block_max};\n",
                 table_name = self.name,
-                schema_name = layout.catalog.site.namespace,
+                qname = self.qualified_name,
                 block_max = BLOCK_NUMBER_MAX
             )
         }
     }
 
-    pub(crate) fn create_attribute_indexes(
-        &self,
-        out: &mut String,
-        layout: &Layout,
-    ) -> fmt::Result {
+    fn create_attribute_indexes(&self, out: &mut String) -> fmt::Result {
         // Create indexes. Skip columns whose type is an array of enum,
         // since there is no good way to index them with Postgres 9.6.
         // Once we move to Postgres 11, we can enable that
@@ -316,12 +257,12 @@ impl Table {
             };
             write!(
             out,
-            "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {schema_name}.\"{table_name}\" using {method}({index_expr});\n",
+            "create index attr_{table_index}_{column_index}_{table_name}_{column_name}\n    on {qname} using {method}({index_expr});\n",
             table_index = self.position,
             table_name = self.name,
             column_index = i,
             column_name = column.name,
-            schema_name = layout.catalog.site.namespace,
+            qname = self.qualified_name,
             method = method,
             index_expr = index_expr,
         )?;
@@ -334,21 +275,29 @@ impl Table {
     ///
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
-    fn as_ddl(&self, out: &mut String, layout: &Layout) -> fmt::Result {
-        self.create_table(out, layout)?;
-        self.create_time_travel_indexes(out, layout)?;
-        self.create_attribute_indexes(out, layout)
+    pub(crate) fn as_ddl(&self, out: &mut String) -> fmt::Result {
+        self.create_table(out)?;
+        self.create_time_travel_indexes(out)?;
+        self.create_attribute_indexes(out)
     }
 
-    pub fn exclusion_ddl(&self, out: &mut String, nsp: &str, as_constraint: bool) -> fmt::Result {
+    pub fn exclusion_ddl(&self, out: &mut String) -> fmt::Result {
+        // Tables with causality regions need to use exclusion constraints for correctness,
+        // to catch violations of write isolation.
+        let as_constraint = self.has_causality_region || CREATE_EXCLUSION_CONSTRAINT;
+
+        self.exclusion_ddl_inner(out, as_constraint)
+    }
+
+    // `pub` for tests.
+    pub(crate) fn exclusion_ddl_inner(&self, out: &mut String, as_constraint: bool) -> fmt::Result {
         if as_constraint {
             writeln!(
                 out,
-                r#"
-        alter table {nsp}.{name}
-          add constraint {bare_name}_{id}_{block_range}_excl exclude using gist ({id} with =, {block_range} with &&);
-               "#,
-                name = self.name.quoted(),
+                "
+    alter table {qname}
+        add constraint {bare_name}_{id}_{block_range}_excl exclude using gist ({id} with =, {block_range} with &&);",
+                qname = self.qualified_name,
                 bare_name = self.name,
                 id = self.primary_key().name,
                 block_range = BLOCK_RANGE_COLUMN
@@ -356,11 +305,11 @@ impl Table {
         } else {
             writeln!(
                 out,
-                r#"
-        create index {bare_name}_{id}_{block_range}_excl on {nsp}.{name}
+                "
+        create index {bare_name}_{id}_{block_range}_excl on {qname}
          using gist ({id}, {block_range});
-               "#,
-                name = self.name.quoted(),
+               ",
+                qname = self.qualified_name,
                 bare_name = self.name,
                 id = self.primary_key().name,
                 block_range = BLOCK_RANGE_COLUMN
@@ -377,7 +326,6 @@ impl Column {
     /// See the unit tests at the end of this file for the actual DDL that
     /// gets generated
     fn as_ddl(&self, out: &mut String) -> fmt::Result {
-        write!(out, "    ")?;
         write!(out, "{:20} {}", self.name.quoted(), self.sql_type())?;
         if self.is_list() {
             write!(out, "[]")?;

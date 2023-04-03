@@ -4,16 +4,12 @@ use std::str::FromStr;
 
 use diesel::{dsl::sql, prelude::*};
 use diesel::{sql_types::Text, PgConnection};
-use regex::Regex;
 
 use graph::components::store::DeploymentId;
 use graph::{
     components::store::DeploymentLocator,
     data::subgraph::status,
-    prelude::{
-        anyhow::{self},
-        lazy_static, DeploymentHash,
-    },
+    prelude::{anyhow, lazy_static, regex::Regex, DeploymentHash},
 };
 use graph_store_postgres::command_support::catalog as store_catalog;
 use graph_store_postgres::connection_pool::ConnectionPool;
@@ -35,6 +31,7 @@ lazy_static! {
 pub enum DeploymentSearch {
     Name { name: String },
     Hash { hash: String, shard: Option<String> },
+    All,
     Deployment { namespace: String },
 }
 
@@ -46,6 +43,7 @@ impl fmt::Display for DeploymentSearch {
                 hash,
                 shard: Some(shard),
             } => write!(f, "{}:{}", hash, shard),
+            DeploymentSearch::All => Ok(()),
             DeploymentSearch::Hash { hash, shard: None } => write!(f, "{}", hash),
             DeploymentSearch::Deployment { namespace } => write!(f, "{}", namespace),
         }
@@ -119,7 +117,34 @@ impl DeploymentSearch {
             DeploymentSearch::Deployment { namespace } => {
                 query.filter(ds::name.eq(&namespace)).load(conn)?
             }
+            DeploymentSearch::All => query.load(conn)?,
         };
+        Ok(deployments)
+    }
+
+    /// Finds all [`Deployment`]s for this [`DeploymentSearch`].
+    pub fn find(
+        &self,
+        pool: ConnectionPool,
+        current: bool,
+        pending: bool,
+        used: bool,
+    ) -> Result<Vec<Deployment>, anyhow::Error> {
+        let current = current || used;
+        let pending = pending || used;
+
+        let deployments = self.lookup(&pool)?;
+        // Filter by status; if neither `current` or `pending` are set, list
+        // all deployments
+        let deployments: Vec<_> = deployments
+            .into_iter()
+            .filter(|deployment| match (current, pending) {
+                (true, false) => deployment.status == "current",
+                (false, true) => deployment.status == "pending",
+                (true, true) => deployment.status == "current" || deployment.status == "pending",
+                (false, false) => true,
+            })
+            .collect();
         Ok(deployments)
     }
 
@@ -174,7 +199,13 @@ impl Deployment {
             "node_id",
         ];
         if !statuses.is_empty() {
-            rows.extend(vec!["synced", "health", "latest block", "chain head block"]);
+            rows.extend(vec![
+                "synced",
+                "health",
+                "earliest block",
+                "latest block",
+                "chain head block",
+            ]);
         }
 
         let mut list = List::new(rows);
@@ -199,6 +230,7 @@ impl Deployment {
                 rows.extend(vec![
                     status.synced.to_string(),
                     status.health.as_str().to_string(),
+                    chain.earliest_block_number.to_string(),
                     chain
                         .latest_block
                         .as_ref()

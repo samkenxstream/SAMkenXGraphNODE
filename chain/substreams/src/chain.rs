@@ -1,6 +1,8 @@
-use crate::{data_source::*, Block, TriggerData, TriggerFilter, TriggersAdapter};
+use crate::{data_source::*, EntityChanges, TriggerData, TriggerFilter, TriggersAdapter};
 use anyhow::Error;
-use core::fmt;
+use graph::blockchain::client::ChainClient;
+use graph::blockchain::{BlockIngestor, EmptyNodeCapabilities, NoopRuntimeAdapter};
+use graph::components::store::DeploymentCursorTracker;
 use graph::firehose::FirehoseEndpoints;
 use graph::prelude::{BlockHash, LoggerFactory, MetricsRegistry};
 use graph::{
@@ -11,25 +13,28 @@ use graph::{
     },
     components::store::DeploymentLocator,
     data::subgraph::UnifiedMappingApiVersion,
-    impl_slog_value,
     prelude::{async_trait, BlockNumber, ChainStore},
     slog::Logger,
 };
-use std::{str::FromStr, sync::Arc};
+use std::sync::Arc;
+
+#[derive(Default, Debug, Clone)]
+pub struct Block {
+    pub hash: BlockHash,
+    pub number: BlockNumber,
+    pub changes: EntityChanges,
+}
 
 impl blockchain::Block for Block {
     fn ptr(&self) -> BlockPtr {
-        return BlockPtr {
-            hash: BlockHash(Box::from(self.block_id.clone())),
-            number: self.block_number as i32,
-        };
+        BlockPtr {
+            hash: self.hash.clone(),
+            number: self.number,
+        }
     }
 
     fn parent_ptr(&self) -> Option<BlockPtr> {
-        Some(BlockPtr {
-            hash: BlockHash(Box::from(self.prev_block_id.clone())),
-            number: self.prev_block_number as i32,
-        })
+        None
     }
 }
 
@@ -38,21 +43,21 @@ pub struct Chain {
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
 
     pub(crate) logger_factory: LoggerFactory,
-    pub(crate) endpoints: FirehoseEndpoints,
-    pub(crate) metrics_registry: Arc<dyn MetricsRegistry>,
+    pub(crate) client: Arc<ChainClient<Self>>,
+    pub(crate) metrics_registry: Arc<MetricsRegistry>,
 }
 
 impl Chain {
     pub fn new(
         logger_factory: LoggerFactory,
-        endpoints: FirehoseEndpoints,
-        metrics_registry: Arc<dyn MetricsRegistry>,
+        firehose_endpoints: FirehoseEndpoints,
+        metrics_registry: Arc<MetricsRegistry>,
         chain_store: Arc<dyn ChainStore>,
         block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
     ) -> Self {
         Self {
             logger_factory,
-            endpoints,
+            client: Arc::new(ChainClient::new_firehose(firehose_endpoints)),
             metrics_registry,
             chain_store,
             block_stream_builder,
@@ -66,35 +71,11 @@ impl std::fmt::Debug for Chain {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, PartialOrd, Ord, Eq)]
-pub struct NodeCapabilities {}
-
-impl FromStr for NodeCapabilities {
-    type Err = Error;
-
-    fn from_str(_s: &str) -> Result<Self, Self::Err> {
-        Ok(NodeCapabilities {})
-    }
-}
-
-impl fmt::Display for NodeCapabilities {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.write_str("substream")
-    }
-}
-
-impl_slog_value!(NodeCapabilities, "{}");
-
-impl graph::blockchain::NodeCapabilities<Chain> for NodeCapabilities {
-    fn from_data_sources(_data_sources: &[DataSource]) -> Self {
-        NodeCapabilities {}
-    }
-}
-
 #[async_trait]
 impl Blockchain for Chain {
     const KIND: BlockchainKind = BlockchainKind::Substreams;
 
+    type Client = ();
     type Block = Block;
     type DataSource = DataSource;
     type UnresolvedDataSource = UnresolvedDataSource;
@@ -112,7 +93,7 @@ impl Blockchain for Chain {
     /// Trigger filter used as input to the triggers adapter.
     type TriggerFilter = TriggerFilter;
 
-    type NodeCapabilities = NodeCapabilities;
+    type NodeCapabilities = EmptyNodeCapabilities<Self>;
 
     fn triggers_adapter(
         &self,
@@ -123,12 +104,11 @@ impl Blockchain for Chain {
         Ok(Arc::new(TriggersAdapter {}))
     }
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: FirehoseCursor,
+        store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
@@ -136,24 +116,24 @@ impl Blockchain for Chain {
             .build_firehose(
                 self,
                 deployment,
-                block_cursor,
+                store.firehose_cursor(),
                 start_blocks,
-                subgraph_current_block,
+                store.block_ptr(),
                 filter,
                 unified_api_version,
             )
             .await
     }
 
-    async fn new_polling_block_stream(
+    fn is_refetch_block_required(&self) -> bool {
+        false
+    }
+    async fn refetch_firehose_block(
         &self,
-        _deployment: DeploymentLocator,
-        _start_blocks: Vec<BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<Self::TriggerFilter>,
-        _unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn BlockStream<Self>>, Error> {
-        unimplemented!("this should never be called for substreams")
+        _logger: &Logger,
+        _cursor: FirehoseCursor,
+    ) -> Result<Block, Error> {
+        unimplemented!("This chain does not support Dynamic Data Sources. is_refetch_block_required always returns false, this shouldn't be called.")
     }
 
     fn chain_store(&self) -> Arc<dyn ChainStore> {
@@ -175,20 +155,14 @@ impl Blockchain for Chain {
         })
     }
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(RuntimeAdapter {})
+        Arc::new(NoopRuntimeAdapter::default())
     }
 
-    fn is_firehose_supported(&self) -> bool {
-        true
+    fn chain_client(&self) -> Arc<ChainClient<Self>> {
+        self.client.clone()
     }
-}
 
-pub struct RuntimeAdapter {}
-impl RuntimeAdapterTrait<crate::Chain> for RuntimeAdapter {
-    fn host_fns(
-        &self,
-        _ds: &<crate::Chain as Blockchain>::DataSource,
-    ) -> Result<Vec<blockchain::HostFn>, Error> {
-        todo!()
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+        unreachable!("Substreams rely on the block ingestor from the network they are processing")
     }
 }

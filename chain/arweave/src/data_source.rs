@@ -1,3 +1,4 @@
+use graph::anyhow::Context;
 use graph::blockchain::{Block, TriggerWithHandler};
 use graph::components::store::StoredDynamicDataSource;
 use graph::data::subgraph::DataSourceContext;
@@ -6,12 +7,12 @@ use graph::{
     anyhow::{anyhow, Error},
     blockchain::{self, Blockchain},
     prelude::{
-        async_trait, info, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Link,
+        async_trait, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Link,
         LinkResolver, Logger,
     },
     semver,
 };
-use std::{convert::TryFrom, sync::Arc};
+use std::sync::Arc;
 
 use crate::chain::Chain;
 use crate::trigger::ArweaveTrigger;
@@ -31,6 +32,10 @@ pub struct DataSource {
 }
 
 impl blockchain::DataSource<Chain> for DataSource {
+    fn from_template_info(_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
+        Err(anyhow!("Arweave subgraphs do not support templates"))
+    }
+
     // FIXME
     //
     // need to decode the base64url encoding?
@@ -67,7 +72,7 @@ impl blockchain::DataSource<Chain> for DataSource {
 
         Ok(Some(TriggerWithHandler::<Chain>::new(
             trigger.cheap_clone(),
-            handler.to_owned(),
+            handler.clone(),
             block.ptr(),
         )))
     }
@@ -81,7 +86,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn network(&self) -> Option<&str> {
-        self.network.as_ref().map(|s| s.as_str())
+        self.network.as_deref()
     }
 
     fn context(&self) -> Arc<Option<DataSourceContext>> {
@@ -227,22 +232,16 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source_address" => format_args!("{:?}", base64_url::encode(&source.owner.clone().unwrap_or_default())), "source_start_block" => source.start_block);
-
-        let mapping = mapping.resolve(resolver, logger).await?;
+        let mapping = mapping.resolve(resolver, logger).await.with_context(|| {
+            format!(
+                "failed to resolve data source {} with source_address {:?} and start_block {}",
+                name,
+                base64_url::encode(&source.owner.clone().unwrap_or_default()),
+                source.start_block
+            )
+        })?;
 
         DataSource::from_manifest(kind, network, name, source, mapping, context)
-    }
-}
-
-/// # TODO
-///
-/// add templates for arweave subgraphs
-impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
-    type Error = Error;
-
-    fn try_from(_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
-        Err(anyhow!("Arweave subgraphs do not support templates"))
     }
 }
 
@@ -272,13 +271,16 @@ impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTem
             mapping,
         } = self;
 
-        info!(logger, "Resolve data source template"; "name" => &name);
+        let mapping = mapping
+            .resolve(resolver, logger)
+            .await
+            .with_context(|| format!("failed to resolve data source template {}", name))?;
 
         Ok(DataSourceTemplate {
             kind,
             network,
             name,
-            mapping: mapping.resolve(resolver, logger).await?,
+            mapping,
         })
     }
 }
@@ -331,8 +333,10 @@ impl UnresolvedMapping {
 
         let api_version = semver::Version::parse(&api_version)?;
 
-        info!(logger, "Resolve mapping"; "link" => &link.link);
-        let module_bytes = resolver.cat(logger, &link).await?;
+        let module_bytes = resolver
+            .cat(logger, &link)
+            .await
+            .with_context(|| format!("failed to resolve mapping {}", link.link))?;
 
         Ok(Mapping {
             api_version,

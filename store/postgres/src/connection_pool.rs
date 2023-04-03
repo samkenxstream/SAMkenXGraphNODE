@@ -8,8 +8,8 @@ use diesel::{sql_query, RunQueryDsl};
 
 use graph::cheap_clone::CheapClone;
 use graph::constraint_violation;
-use graph::prelude::tokio;
 use graph::prelude::tokio::time::Instant;
+use graph::prelude::{tokio, MetricsRegistry};
 use graph::slog::warn;
 use graph::util::timed_rw_lock::TimedMutex;
 use graph::{
@@ -18,7 +18,7 @@ use graph::{
         crit, debug, error, info, o,
         tokio::sync::Semaphore,
         CancelGuard, CancelHandle, CancelToken as _, CancelableError, Counter, Gauge, Logger,
-        MetricsRegistry, MovingStats, PoolWaitStats, StoreError, ENV_VARS,
+        MovingStats, PoolWaitStats, StoreError, ENV_VARS,
     },
     util::security::SafeDisplay,
 };
@@ -54,10 +54,22 @@ impl ForeignServer {
         format!("shard_{}", shard.as_str())
     }
 
-    /// The name of the schema under which the `subgraphs` schema for `shard`
-    /// is accessible in shards that are not `shard`
+    /// The name of the schema under which the `subgraphs` schema for
+    /// `shard` is accessible in shards that are not `shard`. In most cases
+    /// you actually want to use `metadata_schema_in`
     pub fn metadata_schema(shard: &Shard) -> String {
         format!("{}_subgraphs", Self::name(shard))
+    }
+
+    /// The name of the schema under which the `subgraphs` schema for
+    /// `shard` is accessible in the shard `current`. It is permissible for
+    /// `shard` and `current` to be the same.
+    pub fn metadata_schema_in(shard: &Shard, current: &Shard) -> String {
+        if shard == current {
+            "subgraphs".to_string()
+        } else {
+            Self::metadata_schema(&shard)
+        }
     }
 
     pub fn new_from_raw(shard: String, postgres_url: &str) -> Result<Self, anyhow::Error> {
@@ -86,10 +98,15 @@ impl ForeignServer {
         let password = String::from_utf8(
             config
                 .get_password()
-                .ok_or_else(|| anyhow!("could not find user in `{}`", SafeDisplay(postgres_url)))?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "could not find password in `{}`; you must provide one.",
+                        SafeDisplay(postgres_url)
+                    )
+                })?
                 .into(),
         )?;
-        let port = config.get_ports().get(0).cloned().unwrap_or(5432u16);
+        let port = config.get_ports().first().cloned().unwrap_or(5432u16);
         let dbname = config
             .get_dbname()
             .map(|s| s.to_string())
@@ -175,7 +192,7 @@ impl ForeignServer {
                     NAMESPACE_PUBLIC,
                     table_name,
                     Self::PRIMARY_PUBLIC,
-                    Self::name(&*PRIMARY_SHARD).as_str(),
+                    Self::name(&PRIMARY_SHARD).as_str(),
                 )?
             };
             write!(query, "{}", create_stmt)?;
@@ -197,6 +214,8 @@ impl ForeignServer {
             "subgraph_deployment_assignment",
             "subgraph",
             "subgraph_version",
+            "subgraph_deployment",
+            "subgraph_manifest",
         ] {
             let create_stmt =
                 catalog::create_foreign_table(conn, "subgraphs", table_name, &nsp, &self.name)?;
@@ -304,7 +323,7 @@ impl ConnectionPool {
         pool_size: u32,
         fdw_pool_size: Option<u32>,
         logger: &Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         coord: Arc<PoolCoordinator>,
     ) -> ConnectionPool {
         let state_tracker = PoolStateTracker::new();
@@ -355,12 +374,11 @@ impl ConnectionPool {
     /// `StoreError::DatabaseUnavailable`
     fn get_ready(&self) -> Result<Arc<PoolInner>, StoreError> {
         let mut guard = self.inner.lock(&self.logger);
-        if !self.state_tracker.is_available() && !ENV_VARS.store.connection_try_always {
+        if !self.state_tracker.is_available() {
             // We know that trying to use this pool is pointless since the
             // database is not available, and will only lead to other
             // operations having to wait until the connection timeout is
-            // reached. `TRY_ALWAYS` allows users to force us to try
-            // regardless.
+            // reached.
             return Err(StoreError::DatabaseUnavailable);
         }
 
@@ -562,7 +580,6 @@ impl r2d2::HandleError<r2d2::Error> for ErrorHandler {
         // in a locale other than English. In that case, their database will
         // be marked as unavailable even though it is perfectly fine.
         if msg.contains("canceling statement")
-            || msg.contains("no connection to the server")
             || msg.contains("terminating connection due to conflict with recovery")
         {
             return;
@@ -589,7 +606,7 @@ struct EventHandler {
 impl EventHandler {
     fn new(
         logger: Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         wait_stats: PoolWaitStats,
         const_labels: HashMap<String, String>,
         state_tracker: PoolStateTracker,
@@ -707,7 +724,7 @@ impl PoolInner {
         pool_size: u32,
         fdw_pool_size: Option<u32>,
         logger: &Logger,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         state_tracker: PoolStateTracker,
     ) -> PoolInner {
         let logger_store = logger.new(o!("component" => "Store"));
@@ -975,6 +992,7 @@ impl PoolInner {
         let conn = self.get().map_err(|_| StoreError::DatabaseUnavailable)?;
 
         let start = Instant::now();
+
         advisory_lock::lock_migration(&conn)
             .unwrap_or_else(|err| die(&pool.logger, "failed to get migration lock", &err));
         // This code can cause a race in database setup: if pool A has had
@@ -1005,6 +1023,21 @@ impl PoolInner {
             die(&pool.logger, "failed to release migration lock", &err);
         });
         result.unwrap_or_else(|err| die(&pool.logger, "migrations failed", &err));
+
+        // Locale check
+        if let Err(msg) = catalog::Locale::load(&conn)?.suitable() {
+            if &self.shard == &*PRIMARY_SHARD && primary::is_empty(&conn)? {
+                die(
+                    &pool.logger,
+                    "Database does not use C locale. \
+                    Please check the graph-node documentation for how to set up the database locale",
+                    &msg,
+                );
+            } else {
+                warn!(pool.logger, "{}.\nPlease check the graph-node documentation for how to set up the database locale", msg);
+            }
+        }
+
         debug!(&pool.logger, "Setup finished"; "setup_time_s" => start.elapsed().as_secs());
         Ok(())
     }
@@ -1060,7 +1093,11 @@ impl PoolInner {
             conn.transaction(|| ForeignServer::map_primary(&conn, &self.shard))?;
         }
         if &server.shard != &self.shard {
-            info!(&self.logger, "Mapping metadata");
+            info!(
+                &self.logger,
+                "Mapping metadata from {}",
+                server.shard.as_str()
+            );
             let conn = self.get()?;
             conn.transaction(|| server.map_metadata(&conn))?;
         }
@@ -1133,8 +1170,10 @@ impl PoolCoordinator {
         postgres_url: String,
         pool_size: u32,
         fdw_pool_size: Option<u32>,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> ConnectionPool {
+        let is_writable = !pool_name.is_replica();
+
         let pool = ConnectionPool::create(
             name,
             pool_name,
@@ -1145,18 +1184,23 @@ impl PoolCoordinator {
             registry,
             self.cheap_clone(),
         );
-        // It is safe to take this lock here since nobody has seen the pool
-        // yet. We remember the `PoolInner` so that later, when we have to
-        // call `remap()`, we do not have to take this lock as that will be
-        // already held in `get_ready()`
-        match &*pool.inner.lock(logger) {
-            PoolState::Created(inner, _) | PoolState::Ready(inner) => {
-                self.pools
-                    .lock()
-                    .unwrap()
-                    .insert(pool.shard.clone(), inner.clone());
+
+        // Ignore non-writable pools (replicas), there is no need (and no
+        // way) to coordinate schema changes with them
+        if is_writable {
+            // It is safe to take this lock here since nobody has seen the pool
+            // yet. We remember the `PoolInner` so that later, when we have to
+            // call `remap()`, we do not have to take this lock as that will be
+            // already held in `get_ready()`
+            match &*pool.inner.lock(logger) {
+                PoolState::Created(inner, _) | PoolState::Ready(inner) => {
+                    self.pools
+                        .lock()
+                        .unwrap()
+                        .insert(pool.shard.clone(), inner.clone());
+                }
+                PoolState::Disabled => { /* nothing to do */ }
             }
-            PoolState::Disabled => { /* nothing to do */ }
         }
         pool
     }
@@ -1172,18 +1216,16 @@ impl PoolCoordinator {
             .ok_or_else(|| constraint_violation!("unknown shard {shard}"))?;
 
         for pool in self.pools.lock().unwrap().values() {
-            pool.remap(server)?;
+            if let Err(e) = pool.remap(server) {
+                error!(pool.logger, "Failed to map imports from {}", server.shard; "error" => e.to_string());
+                return Err(e);
+            }
         }
         Ok(())
     }
 
     pub fn pools(&self) -> Vec<Arc<PoolInner>> {
-        self.pools
-            .lock()
-            .unwrap()
-            .values()
-            .map(|pool| pool.clone())
-            .collect()
+        self.pools.lock().unwrap().values().cloned().collect()
     }
 
     pub fn servers(&self) -> Arc<Vec<ForeignServer>> {

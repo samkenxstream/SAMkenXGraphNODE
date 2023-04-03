@@ -19,7 +19,7 @@ pub const SUBSTREAMS_KIND: &str = "substreams";
 const DYNAMIC_DATA_SOURCE_ERROR: &str = "Substreams do not support dynamic data sources";
 const TEMPLATE_ERROR: &str = "Substreams do not support templates";
 
-const ALLOWED_MAPPING_KIND: [&'static str; 1] = ["substreams/graph-entities"];
+const ALLOWED_MAPPING_KIND: [&str; 1] = ["substreams/graph-entities"];
 
 #[derive(Clone, Debug, PartialEq)]
 /// Represents the DataSource portion of the manifest once it has been parsed
@@ -34,15 +34,11 @@ pub struct DataSource {
     pub initial_block: Option<BlockNumber>,
 }
 
-impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
-    type Error = anyhow::Error;
-
-    fn try_from(_value: DataSourceTemplateInfo<Chain>) -> Result<Self, Self::Error> {
+impl blockchain::DataSource<Chain> for DataSource {
+    fn from_template_info(_template_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
         Err(anyhow!("Substreams does not support templates"))
     }
-}
 
-impl blockchain::DataSource<Chain> for DataSource {
     fn address(&self) -> Option<&[u8]> {
         None
     }
@@ -60,7 +56,7 @@ impl blockchain::DataSource<Chain> for DataSource {
     }
 
     fn network(&self) -> Option<&str> {
-        self.network.as_ref().map(|s| s.as_str())
+        self.network.as_deref()
     }
 
     fn context(&self) -> Arc<Option<graph::prelude::DataSourceContext>> {
@@ -176,9 +172,30 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
 
         let package = graph::substreams::Package::decode(content.as_ref())?;
 
-        let initial_block: Option<u64> = match package.modules {
-            Some(ref modules) => modules.modules.iter().map(|x| x.initial_block).min(),
+        let module = match package.modules {
+            Some(ref modules) => modules
+                .modules
+                .iter()
+                .find(|module| module.name == self.source.package.module_name),
             None => None,
+        };
+
+        let initial_block: Option<u64> = match module {
+            Some(module) => match &module.kind {
+                Some(graph::substreams::module::Kind::KindMap(_)) => Some(module.initial_block),
+                _ => {
+                    return Err(anyhow!(
+                        "Substreams module {} must be of 'map' kind",
+                        module.name
+                    ))
+                }
+            },
+            None => {
+                return Err(anyhow!(
+                    "Substreams module {} does not exist",
+                    self.source.package.module_name
+                ))
+            }
         };
 
         let initial_block: Option<i32> = initial_block
@@ -263,17 +280,12 @@ mod test {
         components::link_resolver::LinkResolver,
         prelude::{async_trait, serde_yaml, JsonValueStream, Link},
         slog::{o, Discard, Logger},
+        substreams::module::{Kind, KindMap, KindStore},
+        substreams::{Module, Modules, Package},
     };
+    use prost::Message;
 
     use crate::{DataSource, Mapping, UnresolvedDataSource, UnresolvedMapping, SUBSTREAMS_KIND};
-
-    const EMPTY_PACKAGE: graph::substreams::Package = graph::substreams::Package {
-        proto_files: vec![],
-        version: 0,
-        modules: None,
-        module_meta: vec![],
-        package_meta: vec![],
-    };
 
     #[test]
     fn parse_data_source() {
@@ -310,14 +322,14 @@ mod test {
             name: "Uniswap".into(),
             source: crate::Source {
                 module_name: "output".into(),
-                package: EMPTY_PACKAGE,
+                package: gen_package(),
             },
             mapping: Mapping {
                 api_version: semver::Version::from_str("0.0.7").unwrap(),
                 kind: "substreams/graph-entities".into(),
             },
             context: Arc::new(None),
-            initial_block: None,
+            initial_block: Some(123),
         };
         assert_eq!(ds, expected);
     }
@@ -344,6 +356,54 @@ mod test {
         );
     }
 
+    fn gen_package() -> Package {
+        Package {
+            proto_files: vec![],
+            version: 0,
+            modules: Some(Modules {
+                modules: vec![
+                    Module {
+                        name: "output".into(),
+                        initial_block: 123,
+                        binary_entrypoint: "output".into(),
+                        binary_index: 0,
+                        kind: Some(Kind::KindMap(KindMap {
+                            output_type: "proto".into(),
+                        })),
+                        inputs: vec![],
+                        output: None,
+                    },
+                    Module {
+                        name: "store_mod".into(),
+                        initial_block: 0,
+                        binary_entrypoint: "store_mod".into(),
+                        binary_index: 0,
+                        kind: Some(Kind::KindStore(KindStore {
+                            update_policy: 1,
+                            value_type: "proto1".into(),
+                        })),
+                        inputs: vec![],
+                        output: None,
+                    },
+                    Module {
+                        name: "map_mod".into(),
+                        initial_block: 123456,
+                        binary_entrypoint: "other2".into(),
+                        binary_index: 0,
+                        kind: Some(Kind::KindMap(KindMap {
+                            output_type: "proto2".into(),
+                        })),
+                        inputs: vec![],
+                        output: None,
+                    },
+                ],
+                binaries: vec![],
+            }),
+            module_meta: vec![],
+            package_meta: vec![],
+        }
+    }
+
     fn gen_data_source() -> DataSource {
         DataSource {
             kind: SUBSTREAMS_KIND.into(),
@@ -351,7 +411,7 @@ mod test {
             name: "Uniswap".into(),
             source: crate::Source {
                 module_name: "".to_string(),
-                package: EMPTY_PACKAGE,
+                package: gen_package(),
             },
             mapping: Mapping {
                 api_version: semver::Version::from_str("0.0.7").unwrap(),
@@ -391,7 +451,7 @@ mod test {
         }
 
         async fn cat(&self, _logger: &Logger, _link: &Link) -> Result<Vec<u8>, Error> {
-            Ok(vec![])
+            Ok(gen_package().encode_to_vec())
         }
 
         async fn get_block(&self, _logger: &Logger, _link: &Link) -> Result<Vec<u8>, Error> {

@@ -14,7 +14,7 @@ use std::{str::FromStr, sync::Arc};
 
 /// Represents a file on Ipfs. This file can be the CID or a path within a folder CID.
 /// The path cannot have a prefix (ie CID/hello.json would be cid: CID path: "hello.json")
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Default, Eq, PartialEq, Hash)]
 pub struct CidFile {
     pub cid: Cid,
     pub path: Option<String>,
@@ -23,7 +23,7 @@ pub struct CidFile {
 impl Display for CidFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let str = match self.path {
-            Some(ref f) => format!("{}/{}", self.cid.to_string(), f),
+            Some(ref f) => format!("{}/{}", self.cid, f),
             None => self.cid.to_string(),
         };
         f.write_str(&str)
@@ -64,7 +64,7 @@ impl FromStr for CidFile {
             return Ok(CidFile { cid, path: None });
         }
 
-        let file: String = (&s[cid_str.len() + 1..]).to_string();
+        let file: String = s[cid_str.len() + 1..].to_string();
         let path = if file.is_empty() { None } else { Some(file) };
 
         Ok(CidFile { cid, path })
@@ -256,17 +256,14 @@ mod test {
                 name: "correct no slashes, no file",
                 input: cid_str.to_string(),
                 path: cid_str.to_string(),
-                expected: Ok(CidFile {
-                    cid: cid.clone(),
-                    path: None,
-                }),
+                expected: Ok(CidFile { cid, path: None }),
             },
             Case {
                 name: "correct with file path",
                 input: format!("{}/file.json", cid),
                 path: format!("{}/file.json", cid_str),
                 expected: Ok(CidFile {
-                    cid: cid.clone(),
+                    cid,
                     path: Some("file.json".into()),
                 }),
             },
@@ -274,10 +271,7 @@ mod test {
                 name: "correct cid with trailing slash",
                 input: format!("{}/", cid),
                 path: format!("{}", cid),
-                expected: Ok(CidFile {
-                    cid: cid.clone(),
-                    path: None,
-                }),
+                expected: Ok(CidFile { cid, path: None }),
             },
             Case {
                 name: "incorrect, empty",
@@ -290,7 +284,7 @@ mod test {
                 input: format!("{}//", cid),
                 path: format!("{}//", cid),
                 expected: Ok(CidFile {
-                    cid: cid.clone(),
+                    cid,
                     path: Some("/".into()),
                 }),
             },

@@ -10,6 +10,7 @@ use diesel::prelude::{
 use diesel_derives::Associations;
 use git_testament::{git_testament, git_testament_macros};
 use graph::blockchain::BlockHash;
+use graph::components::store::EntityType;
 use graph::data::subgraph::schema::{SubgraphError, SubgraphManifestEntity};
 use graph::prelude::{
     bigdecimal::ToPrimitive, BigDecimal, BlockPtr, DeploymentHash, StoreError,
@@ -49,10 +50,7 @@ pub struct DeploymentDetail {
     pub synced: bool,
     fatal_error: Option<String>,
     non_fatal_errors: Vec<String>,
-    // Not used anymore; only written to keep backwards compatible
-    earliest_ethereum_block_hash: Option<Bytes>,
-    earliest_ethereum_block_number: Option<BigDecimal>,
-    // New tracker for earliest block number
+    /// The earliest block for which we have history
     earliest_block_number: i32,
     pub latest_ethereum_block_hash: Option<Bytes>,
     pub latest_ethereum_block_number: Option<BigDecimal>,
@@ -317,7 +315,7 @@ pub(crate) fn deployment_statuses(
     details_with_fatal_error
         .into_iter()
         .map(|(detail, fatal)| {
-            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or(vec![]);
+            let non_fatal = non_fatal_errors.remove(&detail.id).unwrap_or_default();
             info_from_details(detail, fatal, non_fatal, sites)
         })
         .collect()
@@ -341,6 +339,9 @@ struct StoredSubgraphManifest {
     start_block_number: Option<i32>,
     start_block_hash: Option<Bytes>,
     raw_yaml: Option<String>,
+    entities_with_causality_region: Vec<EntityType>,
+    on_sync: Option<String>,
+    history_blocks: i32,
 }
 
 impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
@@ -352,6 +353,8 @@ impl From<StoredSubgraphManifest> for SubgraphManifestEntity {
             features: value.features,
             schema: value.schema,
             raw_yaml: value.raw_yaml,
+            entities_with_causality_region: value.entities_with_causality_region,
+            history_blocks: value.history_blocks,
         }
     }
 }
@@ -362,13 +365,13 @@ impl TryFrom<StoredDeploymentEntity> for SubgraphDeploymentEntity {
     type Error = StoreError;
 
     fn try_from(ent: StoredDeploymentEntity) -> Result<Self, Self::Error> {
-        let (detail, manifest) = (ent.0, ent.1.into());
+        let (detail, manifest) = (ent.0, ent.1);
 
-        let earliest_block = block(
+        let start_block = block(
             &detail.deployment,
-            "earliest_block",
-            detail.earliest_ethereum_block_hash,
-            detail.earliest_ethereum_block_number,
+            "start_block",
+            manifest.start_block_hash.clone(),
+            manifest.start_block_number.map(|n| n.into()),
         )?
         .map(|block| block.to_ptr());
 
@@ -401,13 +404,14 @@ impl TryFrom<StoredDeploymentEntity> for SubgraphDeploymentEntity {
             .map_err(|b| constraint_violation!("invalid debug fork `{}`", b))?;
 
         Ok(SubgraphDeploymentEntity {
-            manifest,
+            manifest: manifest.into(),
             failed: detail.failed,
             health: detail.health.into(),
             synced: detail.synced,
             fatal_error: None,
             non_fatal_errors: vec![],
-            earliest_block,
+            earliest_block_number: detail.earliest_block_number,
+            start_block,
             latest_block,
             graft_base,
             graft_block,

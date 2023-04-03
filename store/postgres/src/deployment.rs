@@ -1,7 +1,7 @@
 //! Utilities for dealing with deployment metadata. Any connection passed
 //! into these methods must be for the shard that holds the actual
 //! deployment data and metadata
-use crate::{detail::GraphNodeVersion, primary::DeploymentId};
+use crate::{advisory_lock, detail::GraphNodeVersion, primary::DeploymentId};
 use diesel::{
     connection::SimpleConnection,
     dsl::{count, delete, insert_into, select, sql, update},
@@ -13,17 +13,23 @@ use diesel::{
     sql_query,
     sql_types::{Nullable, Text},
 };
-use graph::data::subgraph::{
-    schema::{DeploymentCreate, SubgraphManifestEntity},
-    SubgraphFeature,
-};
-use graph::prelude::{
-    anyhow, bigdecimal::ToPrimitive, hex, web3::types::H256, BigDecimal, BlockNumber, BlockPtr,
-    DeploymentHash, DeploymentState, Schema, StoreError,
-};
 use graph::{blockchain::block_stream::FirehoseCursor, data::subgraph::schema::SubgraphError};
+use graph::{
+    components::store::EntityType,
+    prelude::{
+        anyhow, bigdecimal::ToPrimitive, hex, web3::types::H256, BigDecimal, BlockNumber, BlockPtr,
+        DeploymentHash, DeploymentState, Schema, StoreError,
+    },
+};
+use graph::{
+    data::subgraph::{
+        schema::{DeploymentCreate, SubgraphManifestEntity},
+        SubgraphFeature,
+    },
+    util::backoff::ExponentialBackoff,
+};
 use stable_hash_legacy::crypto::SetHasher;
-use std::{collections::BTreeSet, convert::TryFrom, ops::Bound};
+use std::{collections::BTreeSet, convert::TryFrom, ops::Bound, time::Duration};
 use std::{str::FromStr, sync::Arc};
 
 use crate::connection_pool::ForeignServer;
@@ -58,6 +64,63 @@ impl From<SubgraphHealth> for graph::data::subgraph::schema::SubgraphHealth {
     }
 }
 
+/// Additional behavior for a deployment when it becomes synced
+#[derive(Clone, Copy, Debug)]
+pub enum OnSync {
+    None,
+    /// Activate this deployment
+    Activate,
+    /// Activate this deployment and unassign any other copies of the same
+    /// deployment
+    Replace,
+}
+
+impl TryFrom<Option<&str>> for OnSync {
+    type Error = StoreError;
+
+    fn try_from(value: Option<&str>) -> Result<Self, Self::Error> {
+        match value {
+            None => Ok(OnSync::None),
+            Some("activate") => Ok(OnSync::Activate),
+            Some("replace") => Ok(OnSync::Replace),
+            _ => Err(constraint_violation!("illegal value for on_sync: {value}")),
+        }
+    }
+}
+
+impl OnSync {
+    pub fn activate(&self) -> bool {
+        match self {
+            OnSync::None => false,
+            OnSync::Activate => true,
+            OnSync::Replace => true,
+        }
+    }
+
+    pub fn replace(&self) -> bool {
+        match self {
+            OnSync::None => false,
+            OnSync::Activate => false,
+            OnSync::Replace => true,
+        }
+    }
+
+    pub fn to_str(&self) -> &str {
+        match self {
+            OnSync::None => "none",
+            OnSync::Activate => "activate",
+            OnSync::Replace => "replace",
+        }
+    }
+
+    fn to_sql(&self) -> Option<&str> {
+        match self {
+            OnSync::None => None,
+            OnSync::Activate | OnSync::Replace => Some(self.to_str()),
+        }
+    }
+}
+
 table! {
     subgraphs.subgraph_deployment (id) {
         id -> Integer,
@@ -67,9 +130,6 @@ table! {
         synced -> Bool,
         fatal_error -> Nullable<Text>,
         non_fatal_errors -> Array<Text>,
-        // Not used anymore; only written to keep backwards compatible
-        earliest_ethereum_block_hash -> Nullable<Binary>,
-        earliest_ethereum_block_number -> Nullable<Numeric>,
         earliest_block_number -> Integer,
         latest_ethereum_block_hash -> Nullable<Binary>,
         latest_ethereum_block_number -> Nullable<Numeric>,
@@ -114,6 +174,14 @@ table! {
         start_block_number -> Nullable<Integer>,
         start_block_hash -> Nullable<Binary>,
         raw_yaml -> Nullable<Text>,
+
+        // Entity types that have a `causality_region` column.
+        // Names stored as present in the schema, not in snake case.
+        entities_with_causality_region -> Array<Text>,
+        on_sync -> Nullable<Text>,
+        // How many blocks of history to keep, defaults to `i32::max` for
+        // unlimited history
+        history_blocks -> Integer,
     }
 }
 
@@ -237,28 +305,72 @@ pub fn schema(conn: &PgConnection, site: &Site) -> Result<(Schema, bool), StoreE
         .map(|schema| (schema, use_bytea_prefix))
 }
 
-pub fn manifest_info(
+pub struct ManifestInfo {
+    pub input_schema: Schema,
+    pub description: Option<String>,
+    pub repository: Option<String>,
+    pub spec_version: String,
+    pub instrument: bool,
+}
+
+impl ManifestInfo {
+    pub fn load(conn: &PgConnection, site: &Site) -> Result<ManifestInfo, StoreError> {
+        use subgraph_manifest as sm;
+        let (s, description, repository, spec_version, features): (
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            Vec<String>,
+        ) = sm::table
+            .select((
+                sm::schema,
+                sm::description,
+                sm::repository,
+                sm::spec_version,
+                sm::features,
+            ))
+            .filter(sm::id.eq(site.id))
+            .first(conn)?;
+        let input_schema = Schema::parse(s.as_str(), site.deployment.clone())?;
+
+        // Using the features field to store the instrument flag is a bit
+        // backhanded, but since this will be used very rarely, should not
+        // cause any headaches
+        let instrument = features.iter().any(|s| s == "instrument");
+
+        Ok(ManifestInfo {
+            input_schema,
+            description,
+            repository,
+            spec_version,
+            instrument,
+        })
+    }
+}
+
+// Return how many blocks of history this subgraph should keep
+pub fn history_blocks(conn: &PgConnection, site: &Site) -> Result<BlockNumber, StoreError> {
+    use subgraph_manifest as sm;
+    sm::table
+        .select(sm::history_blocks)
+        .filter(sm::id.eq(site.id))
+        .first::<BlockNumber>(conn)
+        .map_err(StoreError::from)
+}
+
+pub fn set_history_blocks(
     conn: &PgConnection,
     site: &Site,
-) -> Result<(Schema, Option<String>, Option<String>, String), StoreError> {
+    history_blocks: BlockNumber,
+) -> Result<(), StoreError> {
     use subgraph_manifest as sm;
-    let (s, description, repository, spec_version): (
-        String,
-        Option<String>,
-        Option<String>,
-        String,
-    ) = sm::table
-        .select((
-            sm::schema,
-            sm::description,
-            sm::repository,
-            sm::spec_version,
-        ))
-        .filter(sm::id.eq(site.id))
-        .first(conn)?;
-    Schema::parse(s.as_str(), site.deployment.clone())
-        .map_err(|e| StoreError::Unknown(e))
-        .map(|schema| (schema, description, repository, spec_version))
+
+    update(sm::table.filter(sm::id.eq(site.id)))
+        .set(sm::history_blocks.eq(history_blocks))
+        .execute(conn)
+        .map(|_| ())
+        .map_err(StoreError::from)
 }
 
 #[allow(dead_code)]
@@ -297,23 +409,17 @@ pub fn transact_block(
     site: &Site,
     ptr: &BlockPtr,
     firehose_cursor: &FirehoseCursor,
-    full_count_query: &str,
     count: i32,
-) -> Result<(), StoreError> {
+) -> Result<BlockNumber, StoreError> {
     use crate::diesel::BoolExpressionMethods;
     use subgraph_deployment as d;
 
     // Work around a Diesel issue with serializing BigDecimals to numeric
     let number = format!("{}::numeric", ptr.number);
 
-    let count_sql = if count == 0 {
-        // This amounts to a noop - the entity count does not change
-        "entity_count".to_string()
-    } else {
-        entity_count_sql(full_count_query, count)
-    };
+    let count_sql = entity_count_sql(count);
 
-    let row_count = update(
+    let rows = update(
         d::table.filter(d::id.eq(site.id)).filter(
             // Asserts that the processing direction is forward.
             d::latest_ethereum_block_number
@@ -328,16 +434,17 @@ pub fn transact_block(
         d::entity_count.eq(sql(&count_sql)),
         d::current_reorg_depth.eq(0),
     ))
-    .execute(conn)
+    .returning(d::earliest_block_number)
+    .get_results::<BlockNumber>(conn)
     .map_err(StoreError::from)?;
 
-    match row_count {
+    match rows.len() {
         // Common case: A single row was updated.
-        1 => Ok(()),
+        1 => Ok(rows[0]),
 
         // No matching rows were found. This is an error. By the filter conditions, this can only be
         // due to a missing deployment (which `block_ptr` catches) or duplicate block processing.
-        0 => match block_ptr(&conn, &site.deployment)? {
+        0 => match block_ptr(conn, &site.deployment)? {
             Some(block_ptr_from) if block_ptr_from.number >= ptr.number => Err(
                 StoreError::DuplicateBlockProcessing(site.deployment.clone(), ptr.number),
             ),
@@ -470,11 +577,15 @@ pub fn initialize_block_ptr(conn: &PgConnection, site: &Site) -> Result<(), Stor
 
     let needs_init = d::table
         .filter(d::id.eq(site.id))
-        .filter(d::latest_ethereum_block_hash.is_null())
-        .select(d::id)
-        .first::<i32>(conn)
-        .optional()?
-        .is_some();
+        .select(d::latest_ethereum_block_hash)
+        .first::<Option<Vec<u8>>>(conn)
+        .map_err(|e| {
+            constraint_violation!(
+                "deployment sgd{} must have been created before calling initialize_block_ptr but we got {}",
+                site.id, e
+            )
+        })?
+        .is_none();
 
     if needs_init {
         if let (Some(hash), Some(number)) = m::table
@@ -621,7 +732,7 @@ pub fn exists_and_synced(conn: &PgConnection, id: &str) -> Result<bool, StoreErr
 fn insert_subgraph_error(conn: &PgConnection, error: &SubgraphError) -> anyhow::Result<String> {
     use subgraph_error as e;
 
-    let error_id = hex::encode(&stable_hash_legacy::utils::stable_hash::<SetHasher, _>(
+    let error_id = hex::encode(stable_hash_legacy::utils::stable_hash::<SetHasher, _>(
         &error,
     ));
     let SubgraphError {
@@ -765,12 +876,26 @@ pub(crate) fn health(conn: &PgConnection, id: DeploymentId) -> Result<SubgraphHe
         .map_err(|e| e.into())
 }
 
+pub(crate) fn entities_with_causality_region(
+    conn: &PgConnection,
+    id: DeploymentId,
+) -> Result<Vec<EntityType>, StoreError> {
+    use subgraph_manifest as sm;
+
+    sm::table
+        .filter(sm::id.eq(id))
+        .select(sm::entities_with_causality_region)
+        .get_result(conn)
+        .map_err(|e| e.into())
+}
+
 /// Reverts the errors and updates the subgraph health if necessary.
 pub(crate) fn revert_subgraph_errors(
     conn: &PgConnection,
     id: &DeploymentHash,
     reverted_block: BlockNumber,
 ) -> Result<(), StoreError> {
+    use subgraph_deployment as d;
     use subgraph_error as e;
 
     let lower_geq = format!("lower({}) >= ", BLOCK_RANGE_COLUMN);
@@ -784,7 +909,21 @@ pub(crate) fn revert_subgraph_errors(
     // The result will be the same at `reverted_block` or `reverted_block - 1` since the errors at
     // `reverted_block` were just deleted, but semantically we care about `reverted_block - 1` which
     // is the block being reverted to.
-    check_health(conn, id, reverted_block - 1)
+    check_health(conn, id, reverted_block - 1)?;
+
+    // If the deployment is failed in both `failed` and `status` columns,
+    // update both values respectively to `false` and `healthy`. Basically
+    // unfail the statuses.
+    update(
+        d::table
+            .filter(d::deployment.eq(id.as_str()))
+            .filter(d::failed.eq(true))
+            .filter(d::health.eq(SubgraphHealth::Failed)),
+    )
+    .set((d::failed.eq(false), d::health.eq(SubgraphHealth::Healthy)))
+    .execute(conn)
+    .map(|_| ())
+    .map_err(StoreError::from)
 }
 
 pub(crate) fn delete_error(conn: &PgConnection, error_id: &str) -> Result<(), StoreError> {
@@ -805,11 +944,7 @@ pub(crate) fn copy_errors(
 ) -> Result<usize, StoreError> {
     use subgraph_error as e;
 
-    let src_nsp = if src.shard == dst.shard {
-        "subgraphs".to_string()
-    } else {
-        ForeignServer::metadata_schema(&src.shard)
-    };
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
 
     // Check whether there are any errors for dst which indicates we already
     // did copy
@@ -842,7 +977,7 @@ pub(crate) fn copy_errors(
         src_nsp = src_nsp
     );
 
-    Ok(sql_query(&query)
+    Ok(sql_query(query)
         .bind::<Text, _>(src.deployment.as_str())
         .bind::<Text, _>(dst.deployment.as_str())
         .bind::<Integer, _>(target_block.number)
@@ -865,7 +1000,7 @@ pub fn drop_schema(
         "set local lock_timeout=2000; drop schema if exists {} cascade",
         namespace
     );
-    Ok(conn.batch_execute(&*query)?)
+    Ok(conn.batch_execute(&query)?)
 }
 
 pub fn drop_metadata(conn: &PgConnection, site: &Site) -> Result<(), StoreError> {
@@ -907,13 +1042,16 @@ pub fn create_deployment(
                 features,
                 schema,
                 raw_yaml,
+                entities_with_causality_region,
+                history_blocks,
             },
-        earliest_block,
+        start_block,
         graft_base,
         graft_block,
         debug_fork,
     } = deployment;
-    let earliest_block_number = earliest_block.as_ref().map(|ptr| ptr.number).unwrap_or(0);
+    let earliest_block_number = start_block.as_ref().map(|ptr| ptr.number).unwrap_or(0);
+    let entities_with_causality_region = Vec::from_iter(entities_with_causality_region.into_iter());
 
     let deployment_values = (
         d::id.eq(site.id),
@@ -923,8 +1061,6 @@ pub fn create_deployment(
         d::health.eq(SubgraphHealth::Healthy),
         d::fatal_error.eq::<Option<String>>(None),
         d::non_fatal_errors.eq::<Vec<String>>(vec![]),
-        d::earliest_ethereum_block_hash.eq(b(&earliest_block)),
-        d::earliest_ethereum_block_number.eq(n(&earliest_block)),
         d::earliest_block_number.eq(earliest_block_number),
         d::latest_ethereum_block_hash.eq(sql("null")),
         d::latest_ethereum_block_number.eq(sql("null")),
@@ -948,9 +1084,11 @@ pub fn create_deployment(
         // New subgraphs index only a prefix of bytea columns
         // see: attr-bytea-prefix
         m::use_bytea_prefix.eq(true),
-        m::start_block_hash.eq(b(&earliest_block)),
-        m::start_block_number.eq(earliest_block_number),
+        m::start_block_hash.eq(b(&start_block)),
+        m::start_block_number.eq(start_block.as_ref().map(|ptr| ptr.number)),
         m::raw_yaml.eq(raw_yaml),
+        m::entities_with_causality_region.eq(entities_with_causality_region),
+        m::history_blocks.eq(history_blocks),
     );
 
     if exists && replace {
@@ -973,42 +1111,18 @@ pub fn create_deployment(
     Ok(())
 }
 
-fn entity_count_sql(full_count_query: &str, count: i32) -> String {
-    // The big complication in this query is how to determine what the
-    // new entityCount should be. We want to make sure that if the entityCount
-    // is NULL or the special value `-1`, it gets recomputed. Using `-1` here
-    // makes it possible to manually set the `entityCount` to that value
-    // to force a recount; setting it to `NULL` is not desirable since
-    // `entityCount` on the GraphQL level is not nullable, and so setting
-    // `entityCount` to `NULL` could cause errors at that layer; temporarily
-    // returning `-1` is more palatable. To be exact, recounts have to be
-    // done here, from the subgraph writer.
-    //
-    // The first argument of `coalesce` will be `NULL` if the entity count
-    // is `NULL` or `-1`, forcing `coalesce` to evaluate its second
-    // argument, the query to count entities. In all other cases,
-    // `coalesce` does not evaluate its second argument
-    format!(
-        "coalesce((nullif(entity_count, -1)) + ({count}),
-                  ({full_count_query}))",
-        full_count_query = full_count_query,
-        count = count
-    )
+fn entity_count_sql(count: i32) -> String {
+    format!("entity_count + ({count})")
 }
 
-pub fn update_entity_count(
-    conn: &PgConnection,
-    site: &Site,
-    full_count_query: &str,
-    count: i32,
-) -> Result<(), StoreError> {
+pub fn update_entity_count(conn: &PgConnection, site: &Site, count: i32) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
     if count == 0 {
         return Ok(());
     }
 
-    let count_sql = entity_count_sql(full_count_query, count);
+    let count_sql = entity_count_sql(count);
     update(d::table.filter(d::id.eq(site.id)))
         .set(d::entity_count.eq(sql(&count_sql)))
         .execute(conn)?;
@@ -1030,6 +1144,11 @@ pub fn set_entity_count(
     Ok(())
 }
 
+/// Set the earliest block of `site` to the larger of `earliest_block` and
+/// the current value. This means that the `earliest_block_number` can never
+/// go backwards, only forward. This is important so that copying into
+/// `site` can not move the earliest block backwards if `site` was also
+/// pruned while the copy was running.
 pub fn set_earliest_block(
     conn: &PgConnection,
     site: &Site,
@@ -1039,22 +1158,72 @@ pub fn set_earliest_block(
 
     update(d::table.filter(d::id.eq(site.id)))
         .set(d::earliest_block_number.eq(earliest_block))
+        .filter(d::earliest_block_number.lt(earliest_block))
         .execute(conn)?;
     Ok(())
 }
 
-/// Lock the row for `site` in `subgraph_deployment` for update for the
-/// remainder of the current transaction. This lock is used to coordinate
-/// the changes that the subgraph writer makes with changes that other parts
-/// of the system, in particular, pruning make
-//  see also: deployment-lock-for-update
-pub fn lock(conn: &PgConnection, site: &Site) -> Result<(), StoreError> {
+/// Copy the `earliest_block` attribute from `src` to `dst`. The copy might
+/// go across shards and use the metadata tables mapped into the shard for
+/// `conn` which must be the shard for `dst`
+pub fn copy_earliest_block(conn: &PgConnection, src: &Site, dst: &Site) -> Result<(), StoreError> {
     use subgraph_deployment as d;
 
-    d::table
-        .select(d::id)
-        .filter(d::id.eq(site.id))
-        .for_update()
-        .get_result::<DeploymentId>(conn)?;
+    let src_nsp = ForeignServer::metadata_schema_in(&src.shard, &dst.shard);
+
+    let query = format!(
+        "(select earliest_block_number from {src_nsp}.subgraph_deployment where id = {})",
+        src.id
+    );
+
+    update(d::table.filter(d::id.eq(dst.id)))
+        .set(d::earliest_block_number.eq(sql(&query)))
+        .execute(conn)?;
+
     Ok(())
+}
+
+pub fn on_sync(conn: &PgConnection, id: impl Into<DeploymentId>) -> Result<OnSync, StoreError> {
+    use subgraph_manifest as m;
+
+    let s = m::table
+        .filter(m::id.eq(id.into()))
+        .select(m::on_sync)
+        .get_result::<Option<String>>(conn)?;
+    OnSync::try_from(s.as_deref())
+}
+
+pub fn set_on_sync(conn: &PgConnection, site: &Site, on_sync: OnSync) -> Result<(), StoreError> {
+    use subgraph_manifest as m;
+
+    let n = update(m::table.filter(m::id.eq(site.id)))
+        .set(m::on_sync.eq(on_sync.to_sql()))
+        .execute(conn)?;
+
+    match n {
+        0 => Err(StoreError::DeploymentNotFound(site.to_string())),
+        1 => Ok(()),
+        _ => Err(constraint_violation!(
+            "multiple manifests for deployment {}",
+            site.to_string()
+        )),
+    }
+}
+
+/// Lock the deployment `site` for writes while `f` is running. The lock can
+/// cross transactions, and `f` can therefore execute multiple transactions
+/// while other write activity for that deployment is locked out. Block the
+/// current thread until we can acquire the lock.
+//  see also: deployment-lock-for-update
+pub fn with_lock<F, R>(conn: &PgConnection, site: &Site, f: F) -> Result<R, StoreError>
+where
+    F: FnOnce() -> Result<R, StoreError>,
+{
+    let mut backoff = ExponentialBackoff::new(Duration::from_millis(100), Duration::from_secs(15));
+    while !advisory_lock::lock_deployment_session(conn, site)? {
+        backoff.sleep();
+    }
+    let res = f();
+    advisory_lock::unlock_deployment_session(conn, site)?;
+    res
 }

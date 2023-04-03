@@ -65,8 +65,7 @@ static data.
 | `deployment`                         | `text!`    | IPFS hash                                    |
 | `failed`                             | `boolean!` |                                              |
 | `synced`                             | `boolean!` |                                              |
-| `earliest_ethereum_block_hash`       | `bytea`    | start block from manifest (to be removed)    |
-| `earliest_ethereum_block_number`     | `numeric`  |                                              |
+| `earliest_block_number`              | `integer!` | earliest block for which we have data        |
 | `latest_ethereum_block_hash`         | `bytea`    | current subgraph head                        |
 | `latest_ethereum_block_number`       | `numeric`  |                                              |
 | `entity_count`                       | `numeric!` | total number of entities                     |
@@ -106,6 +105,8 @@ shard alongside the deployment's data in `sgdNNN`.
 | `use_bytea_prefix`      | `boolean!` |                                                      |
 | `start_block_hash`      | `bytea`    | Parent of the smallest start block from the manifest |
 | `start_block_number`    | `int4`     |                                                      |
+| `on_sync`               | `text`     | Additional behavior when deployment becomes synced   |
+| `history_blocks`        | `int4!`    | How many blocks of history to keep                   |
 
 ### `subgraph_deployment_assignment`
 

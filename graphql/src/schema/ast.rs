@@ -34,6 +34,8 @@ pub(crate) enum FilterOp {
     NotEndsWithNoCase,
     Equal,
     Child,
+    And,
+    Or,
 }
 
 /// Split a "name_eq" style name into an attribute ("name") and a filter op (`Equal`).
@@ -66,12 +68,18 @@ pub(crate) fn parse_field_as_filter(key: &str) -> (String, FilterOp) {
         }
         k if k.ends_with("_ends_with") => ("_ends_with", FilterOp::EndsWith),
         k if k.ends_with("_ends_with_nocase") => ("_ends_with_nocase", FilterOp::EndsWithNoCase),
-        k if k.ends_with("_") => ("_", FilterOp::Child),
+        k if k.ends_with('_') => ("_", FilterOp::Child),
+        k if k.eq("and") => ("and", FilterOp::And),
+        k if k.eq("or") => ("or", FilterOp::Or),
         _ => ("", FilterOp::Equal),
     };
 
-    // Strip the operator suffix to get the attribute.
-    (key.trim_end_matches(suffix).to_owned(), op)
+    return match op {
+        FilterOp::And => (key.to_owned(), op),
+        FilterOp::Or => (key.to_owned(), op),
+        // Strip the operator suffix to get the attribute.
+        _ => (key.trim_end_matches(suffix).to_owned(), op),
+    };
 }
 
 /// An `ObjectType` with `Hash` and `Eq` derived from the name.
@@ -200,8 +208,8 @@ pub fn get_field<'a>(
 /// Returns the value type for a GraphQL field type.
 pub fn get_field_value_type(field_type: &s::Type) -> Result<ValueType, Error> {
     match field_type {
-        s::Type::NamedType(ref name) => ValueType::from_str(&name),
-        s::Type::NonNullType(inner) => get_field_value_type(&inner),
+        s::Type::NamedType(ref name) => ValueType::from_str(name),
+        s::Type::NonNullType(inner) => get_field_value_type(inner),
         s::Type::ListType(_) => Err(anyhow!("Only scalar values are supported in this context")),
     }
 }
@@ -438,22 +446,20 @@ fn entity_validation() {
         let key = EntityKey::data("Thing".to_owned(), id.clone());
 
         let err = thing.validate(&schema, &key);
-        if errmsg == "" {
+        if errmsg.is_empty() {
             assert!(
                 err.is_ok(),
                 "checking entity {}: expected ok but got {}",
                 id,
                 err.unwrap_err()
             );
+        } else if let Err(e) = err {
+            assert_eq!(errmsg, e.to_string(), "checking entity {}", id);
         } else {
-            if let Err(e) = err {
-                assert_eq!(errmsg, e.to_string(), "checking entity {}", id);
-            } else {
-                panic!(
-                    "Expected error `{}` but got ok when checking entity {}",
-                    errmsg, id
-                );
-            }
+            panic!(
+                "Expected error `{}` but got ok when checking entity {}",
+                errmsg, id
+            );
         }
     }
 

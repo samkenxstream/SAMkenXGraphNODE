@@ -10,7 +10,7 @@ use super::{Block, BlockPtr, Blockchain};
 use crate::anyhow::Result;
 use crate::components::store::{BlockNumber, DeploymentLocator};
 use crate::data::subgraph::UnifiedMappingApiVersion;
-use crate::firehose;
+use crate::firehose::{self, FirehoseEndpoint};
 use crate::substreams::BlockScopedData;
 use crate::{prelude::*, prometheus::labels};
 
@@ -84,6 +84,19 @@ pub trait BlockStream<C: Blockchain>:
 {
 }
 
+/// BlockRefetcher abstraction allows a chain to decide if a block must be refetched after a dynamic data source was added
+#[async_trait]
+pub trait BlockRefetcher<C: Blockchain>: Send + Sync {
+    fn required(&self, chain: &C) -> bool;
+
+    async fn get_block(
+        &self,
+        chain: &C,
+        logger: &Logger,
+        cursor: FirehoseCursor,
+    ) -> Result<C::Block, Error>;
+}
+
 /// BlockStreamBuilder is an abstraction that would separate the logic for building streams from the blockchain trait
 #[async_trait]
 pub trait BlockStreamBuilder<C: Blockchain>: Send + Sync {
@@ -100,7 +113,7 @@ pub trait BlockStreamBuilder<C: Blockchain>: Send + Sync {
 
     async fn build_polling(
         &self,
-        chain: Arc<C>,
+        chain: &C,
         deployment: DeploymentLocator,
         start_blocks: Vec<BlockNumber>,
         subgraph_current_block: Option<BlockPtr>,
@@ -123,7 +136,7 @@ impl FirehoseCursor {
 
 impl fmt::Display for FirehoseCursor {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        f.write_str(&self.0.as_deref().unwrap_or(""))
+        f.write_str(self.0.as_deref().unwrap_or(""))
     }
 }
 
@@ -131,7 +144,7 @@ impl From<String> for FirehoseCursor {
     fn from(cursor: String) -> Self {
         // Treat a cursor of "" as None, not absolutely necessary for correctness since the firehose
         // treats both as the same, but makes it a little clearer.
-        if cursor == "" {
+        if cursor.is_empty() {
             FirehoseCursor::None
         } else {
             FirehoseCursor(Some(cursor))
@@ -173,9 +186,31 @@ where
 }
 
 impl<C: Blockchain> BlockWithTriggers<C> {
-    pub fn new(block: C::Block, mut trigger_data: Vec<C::TriggerData>) -> Self {
+    /// Creates a BlockWithTriggers structure, which holds
+    /// the trigger data ordered and without any duplicates.
+    pub fn new(block: C::Block, mut trigger_data: Vec<C::TriggerData>, logger: &Logger) -> Self {
         // This is where triggers get sorted.
         trigger_data.sort();
+
+        let old_len = trigger_data.len();
+
+        // This is removing the duplicate triggers in the case of multiple
+        // data sources fetching the same event/call/etc.
+        trigger_data.dedup();
+
+        let new_len = trigger_data.len();
+
+        if new_len != old_len {
+            debug!(
+                logger,
+                "Trigger data had duplicate triggers";
+                "block_number" => block.number(),
+                "block_hash" => block.hash().hash_hex(),
+                "old_length" => old_len,
+                "new_length" => new_len,
+            );
+        }
+
         Self {
             block,
             trigger_data,
@@ -254,6 +289,7 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
     async fn block_ptr_for_number(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         number: BlockNumber,
     ) -> Result<BlockPtr, Error>;
 
@@ -271,6 +307,7 @@ pub trait FirehoseMapper<C: Blockchain>: Send + Sync {
     async fn final_block_ptr_for(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         block: &C::Block,
     ) -> Result<BlockPtr, Error>;
 }
@@ -299,6 +336,8 @@ pub enum FirehoseError {
 
 #[derive(Error, Debug)]
 pub enum SubstreamsError {
+    #[error("response is missing the clock information")]
+    MissingClockError,
     /// We were unable to decode the received block payload into the chain specific Block struct (e.g. chain_ethereum::pb::Block)
     #[error("received gRPC block payload cannot be decoded: {0}")]
     DecodingError(#[from] prost::DecodeError),
@@ -308,10 +347,13 @@ pub enum SubstreamsError {
     UnknownError(#[from] anyhow::Error),
 
     #[error("multiple module output error")]
-    MultipleModuleOutputError(),
+    MultipleModuleOutputError,
+
+    #[error("module output was not available (none) or wrong data provided")]
+    ModuleOutputNotPresentOrUnexpected,
 
     #[error("unexpected store delta output")]
-    UnexpectedStoreDeltaOutput(),
+    UnexpectedStoreDeltaOutput,
 }
 
 #[derive(Debug)]
@@ -344,7 +386,7 @@ pub struct BlockStreamMetrics {
 
 impl BlockStreamMetrics {
     pub fn new(
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
         deployment_id: &DeploymentHash,
         network: String,
         shard: String,
@@ -457,7 +499,7 @@ mod test {
         let mut count = 0;
         loop {
             match stream.next().await {
-                None if blocks.len() == 0 => panic!("None before blocks"),
+                None if blocks.is_empty() => panic!("None before blocks"),
                 Some(Err(CancelableError::Cancel)) => {
                     assert!(guard.is_canceled(), "Guard shouldn't be called yet");
 

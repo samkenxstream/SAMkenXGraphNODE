@@ -5,8 +5,8 @@ use diesel::{
     types::{FromSql, ToSql},
 };
 use std::{
-    collections::HashMap,
-    sync::{Arc, Mutex},
+    collections::{BTreeMap, HashMap},
+    sync::{atomic::AtomicU8, Arc, Mutex},
 };
 use std::{fmt, io::Write};
 use std::{iter::FromIterator, time::Duration};
@@ -17,7 +17,7 @@ use graph::{
         server::index_node::VersionInfo,
         store::{
             self, BlockStore, DeploymentLocator, DeploymentSchemaVersion,
-            EnsLookup as EnsLookupTrait, PruneReporter, SubgraphFork,
+            EnsLookup as EnsLookupTrait, PruneReporter, PruneRequest, SubgraphFork,
         },
     },
     constraint_violation,
@@ -26,22 +26,20 @@ use graph::{
     prelude::StoreEvent,
     prelude::{
         anyhow, futures03::future::join_all, lazy_static, o, web3::types::Address, ApiSchema,
-        ApiVersion, BlockHash, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation,
-        Logger, MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError,
-        SubgraphDeploymentEntity, SubgraphName, SubgraphStore as SubgraphStoreTrait,
-        SubgraphVersionSwitchingMode,
+        ApiVersion, BlockNumber, BlockPtr, ChainStore, DeploymentHash, EntityOperation, Logger,
+        MetricsRegistry, NodeId, PartialBlockPtr, Schema, StoreError, SubgraphDeploymentEntity,
+        SubgraphName, SubgraphStore as SubgraphStoreTrait, SubgraphVersionSwitchingMode,
     },
     url::Url,
     util::timed_cache::TimedCache,
 };
 
-use crate::fork;
 use crate::{
     connection_pool::ConnectionPool,
-    deployment::SubgraphHealth,
+    deployment::{OnSync, SubgraphHealth},
     primary,
     primary::{DeploymentId, Mirror as PrimaryMirror, Site},
-    relational::Layout,
+    relational::{index::Method, Layout},
     writable::WritableStore,
     NotificationSender,
 };
@@ -50,6 +48,7 @@ use crate::{
     detail::DeploymentDetail,
     primary::UnusedDeployment,
 };
+use crate::{fork, relational::index::CreateIndex, relational::SqlName};
 
 /// The name of a database shard; valid names must match `[a-z0-9_]+`
 #[derive(Clone, Debug, Eq, PartialEq, Hash, AsExpression, FromSqlRow)]
@@ -66,9 +65,9 @@ const SITES_CACHE_TTL: Duration = Duration::from_secs(120);
 impl Shard {
     pub fn new(name: String) -> Result<Self, StoreError> {
         if name.is_empty() {
-            return Err(StoreError::InvalidIdentifier(format!(
-                "shard names must not be empty"
-            )));
+            return Err(StoreError::InvalidIdentifier(
+                "shard names must not be empty".to_string(),
+            ));
         }
         if name.len() > 30 {
             return Err(StoreError::InvalidIdentifier(format!(
@@ -219,7 +218,7 @@ impl SubgraphStore {
         placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
         sender: Arc<NotificationSender>,
         fork_base: Option<Url>,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self {
         Self {
             inner: Arc::new(SubgraphStoreInner::new(
@@ -275,7 +274,7 @@ pub struct SubgraphStoreInner {
     placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
     sender: Arc<NotificationSender>,
     writables: Mutex<HashMap<DeploymentId, Arc<WritableStore>>>,
-    registry: Arc<dyn MetricsRegistry>,
+    registry: Arc<MetricsRegistry>,
 }
 
 impl SubgraphStoreInner {
@@ -298,7 +297,7 @@ impl SubgraphStoreInner {
         stores: Vec<(Shard, ConnectionPool, Vec<ConnectionPool>, Vec<usize>)>,
         placer: Arc<dyn DeploymentPlacer + Send + Sync + 'static>,
         sender: Arc<NotificationSender>,
-        registry: Arc<dyn MetricsRegistry>,
+        registry: Arc<MetricsRegistry>,
     ) -> Self {
         let mirror = {
             let pools = HashMap::from_iter(
@@ -373,7 +372,21 @@ impl SubgraphStoreInner {
         Ok(site)
     }
 
-    fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
+    fn evict(&self, id: &DeploymentHash) -> Result<(), StoreError> {
+        if let Some((site, _)) = self.sites.remove(id) {
+            let store = self.stores.get(&site.shard).ok_or_else(|| {
+                constraint_violation!(
+                    "shard {} for deployment sgd{} not found when evicting",
+                    site.shard,
+                    site.id
+                )
+            })?;
+            store.layout_cache.remove(&site);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn find_site(&self, id: DeploymentId) -> Result<Arc<Site>, StoreError> {
         if let Some(site) = self.sites.find(|site| site.id == id) {
             return Ok(site);
         }
@@ -499,6 +512,8 @@ impl SubgraphStoreInner {
         #[cfg(not(debug_assertions))]
         assert!(!replace);
 
+        self.evict(&schema.id)?;
+
         let graft_base = deployment
             .graft_base
             .as_ref()
@@ -544,6 +559,7 @@ impl SubgraphStoreInner {
             site.clone(),
             graft_base,
             replace,
+            OnSync::None,
         )?;
 
         let exists_and_synced = |id: &DeploymentHash| {
@@ -571,6 +587,7 @@ impl SubgraphStoreInner {
         shard: Shard,
         node: NodeId,
         block: BlockPtr,
+        on_sync: OnSync,
     ) -> Result<DeploymentLocator, StoreError> {
         let src = self.find_site(src.id.into())?;
         let src_store = self.for_site(src.as_ref())?;
@@ -607,7 +624,7 @@ impl SubgraphStoreInner {
         // Transmogrify the deployment into a new one
         let deployment = DeploymentCreate {
             manifest: deployment.manifest,
-            earliest_block: deployment.earliest_block.clone(),
+            start_block: deployment.start_block.clone(),
             graft_base: Some(src.deployment.clone()),
             graft_block: Some(block),
             debug_fork: deployment.debug_fork,
@@ -630,6 +647,7 @@ impl SubgraphStoreInner {
             dst.clone(),
             Some(graft_base),
             false,
+            on_sync,
         )?;
 
         let pconn = self.primary_conn()?;
@@ -793,14 +811,13 @@ impl SubgraphStoreInner {
 
         // Check that it is not current/pending for any subgraph if it is
         // the active deployment of that subgraph
-        if site.active {
-            if !self
+        if site.active
+            && !self
                 .primary_conn()?
                 .subgraphs_using_deployment(site.as_ref())?
                 .is_empty()
-            {
-                removable = false;
-            }
+        {
+            removable = false;
         }
 
         if removable {
@@ -813,6 +830,11 @@ impl SubgraphStoreInner {
         }
 
         Ok(())
+    }
+
+    pub fn status_for_id(&self, id: graph::components::store::DeploymentId) -> status::Info {
+        let filter = status::Filter::DeploymentIds(vec![id]);
+        self.status(filter).unwrap().into_iter().next().unwrap()
     }
 
     pub(crate) fn status(&self, filter: status::Filter) -> Result<Vec<status::Info>, StoreError> {
@@ -862,7 +884,7 @@ impl SubgraphStoreInner {
             let id = DeploymentHash::new(deployment_id.clone())
                 .map_err(|id| constraint_violation!("illegal deployment id {}", id))?;
             let (store, site) = self.store(&id)?;
-            let statuses = store.deployment_statuses(&vec![site.clone()])?;
+            let statuses = store.deployment_statuses(&[site.clone()])?;
             let status = statuses
                 .first()
                 .ok_or_else(|| StoreError::DeploymentNotFound(deployment_id.clone()))?;
@@ -940,7 +962,7 @@ impl SubgraphStoreInner {
         block_number: BlockNumber,
         block_store: Arc<impl BlockStore>,
     ) -> Result<Option<(PartialBlockPtr, [u8; 32])>, StoreError> {
-        let (store, site) = self.store(&id)?;
+        let (store, site) = self.store(id)?;
 
         let chain_store = match block_store.chain_store(&site.network) {
             Some(chain_store) => chain_store,
@@ -956,7 +978,7 @@ impl SubgraphStoreInner {
         }
 
         // This `unwrap` is safe to do now
-        let block_hash = BlockHash::from(hashes.pop().unwrap());
+        let block_hash = hashes.pop().unwrap();
 
         let block_for_poi_query = BlockPtr::new(block_hash.clone(), block_number);
         let indexer = Some(Address::zero());
@@ -1006,13 +1028,48 @@ impl SubgraphStoreInner {
         .await;
     }
 
+    pub async fn refresh_materialized_views(&self, logger: &Logger) {
+        join_all(
+            self.stores
+                .values()
+                .map(|store| store.refresh_materialized_views(logger)),
+        )
+        .await;
+    }
+
     pub fn analyze(
         &self,
         deployment: &DeploymentLocator,
-        entity_name: &str,
+        entity_name: Option<&str>,
     ) -> Result<(), StoreError> {
         let (store, site) = self.store(&deployment.hash)?;
         store.analyze(site, entity_name)
+    }
+
+    /// Return the statistics targets for all tables of `deployment`. The
+    /// first return value is the default target, and the second value maps
+    /// the name of each table to a map of column name to its statistics
+    /// target. A value of `-1` means that the global default will be used.
+    pub fn stats_targets(
+        &self,
+        deployment: &DeploymentLocator,
+    ) -> Result<(i32, BTreeMap<SqlName, BTreeMap<SqlName, i32>>), StoreError> {
+        let (store, site) = self.store(&deployment.hash)?;
+        store.stats_targets(site)
+    }
+
+    /// Set the statistics target for columns `columns` in `deployment`. If
+    /// `entity` is `Some`, only set it for the table for that entity, if it
+    /// is `None`, set it for all tables in the deployment.
+    pub fn set_stats_target(
+        &self,
+        deployment: &DeploymentLocator,
+        entity: Option<&str>,
+        columns: Vec<String>,
+        target: i32,
+    ) -> Result<(), StoreError> {
+        let (store, site) = self.store(&deployment.hash)?;
+        store.set_stats_target(site, entity, columns, target)
     }
 
     pub async fn create_manual_index(
@@ -1020,7 +1077,7 @@ impl SubgraphStoreInner {
         deployment: &DeploymentLocator,
         entity_name: &str,
         field_names: Vec<String>,
-        index_method: String,
+        index_method: Method,
     ) -> Result<(), StoreError> {
         let (store, site) = self.store(&deployment.hash)?;
         store
@@ -1032,7 +1089,7 @@ impl SubgraphStoreInner {
         &self,
         deployment: &DeploymentLocator,
         entity_name: &str,
-    ) -> Result<Vec<String>, StoreError> {
+    ) -> Result<Vec<CreateIndex>, StoreError> {
         let (store, site) = self.store(&deployment.hash)?;
         store.indexes_for_entity(site, entity_name).await
     }
@@ -1056,20 +1113,7 @@ impl SubgraphStoreInner {
         store.set_account_like(site, table, is_account_like).await
     }
 
-    /// Remove the history that is only needed to respond to queries before
-    /// block number `earliest_block` from the given deployment
-    ///
-    /// Only tables with a ratio of entities to entity versions below
-    /// `prune_ratio` will be pruned; that ratio is determined by looking at
-    /// Postgres planner stats to avoid lengthy counting queries. It is
-    /// assumed that if the ratio is higher than `prune_ratio` that pruning
-    /// won't make much of a difference and will just cause unnecessary
-    /// work.
-    ///
-    /// The `reorg_threshold` is used to determine which blocks will not be
-    /// modified any more by the subgraph writer that may be running
-    /// concurrently to reduce the amount of time that the writer needs to
-    /// be locked out while pruning is happening.
+    /// Prune the history according to the parameters in `req`.
     ///
     /// Pruning can take a long time, and is structured into multiple
     /// transactions such that none of them takes an excessively long time.
@@ -1080,18 +1124,26 @@ impl SubgraphStoreInner {
         &self,
         reporter: Box<dyn PruneReporter>,
         deployment: &DeploymentLocator,
-        earliest_block: BlockNumber,
-        reorg_threshold: BlockNumber,
-        prune_ratio: f64,
+        req: PruneRequest,
     ) -> Result<Box<dyn PruneReporter>, StoreError> {
         // Find the store by the deployment id; otherwise, we could only
         // prune the active copy of the deployment with `deployment.hash`
         let site = self.find_site(deployment.id.into())?;
         let store = self.for_site(&site)?;
 
-        store
-            .prune(reporter, site, earliest_block, reorg_threshold, prune_ratio)
-            .await
+        store.prune(reporter, site, req).await
+    }
+
+    pub fn set_history_blocks(
+        &self,
+        deployment: &DeploymentLocator,
+        history_blocks: BlockNumber,
+        reorg_threshold: BlockNumber,
+    ) -> Result<(), StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let store = self.for_site(&site)?;
+
+        store.set_history_blocks(&site, history_blocks, reorg_threshold)
     }
 
     pub fn load_deployment(&self, site: &Site) -> Result<SubgraphDeploymentEntity, StoreError> {
@@ -1100,8 +1152,35 @@ impl SubgraphStoreInner {
     }
 }
 
+const STATE_ENS_NOT_CHECKED: u8 = 0;
+const STATE_ENS_EMPTY: u8 = 1;
+const STATE_ENS_NOT_EMPTY: u8 = 2;
+
+/// EnsLookup reads from a rainbow table store in postgres that needs to be manually
+/// loaded. To avoid unnecessary database roundtrips, the empty table check is lazy
+/// and will not be retried. Once the table is checked, any subsequent calls will
+/// just used the stored result.
 struct EnsLookup {
     primary: ConnectionPool,
+    // In order to keep the struct lock free, we'll use u8 for the status:
+    // 0 - Not Checked
+    // 1 - Checked - empty
+    // 2 - Checked - non empty
+    state: AtomicU8,
+}
+
+impl EnsLookup {
+    pub fn new(pool: ConnectionPool) -> Self {
+        Self {
+            primary: pool,
+            state: AtomicU8::new(STATE_ENS_NOT_CHECKED),
+        }
+    }
+
+    fn is_table_empty(pool: &ConnectionPool) -> Result<bool, StoreError> {
+        let conn = pool.get()?;
+        primary::Connection::new(conn).is_ens_table_empty()
+    }
 }
 
 impl EnsLookupTrait for EnsLookup {
@@ -1109,14 +1188,31 @@ impl EnsLookupTrait for EnsLookup {
         let conn = self.primary.get()?;
         primary::Connection::new(conn).find_ens_name(hash)
     }
+
+    fn is_table_empty(&self) -> Result<bool, StoreError> {
+        match self.state.load(std::sync::atomic::Ordering::SeqCst) {
+            STATE_ENS_NOT_CHECKED => {}
+            STATE_ENS_EMPTY => return Ok(true),
+            STATE_ENS_NOT_EMPTY => return Ok(false),
+            _ => unreachable!("unsupported state"),
+        }
+
+        let is_empty = Self::is_table_empty(&self.primary)?;
+        let new_state = match is_empty {
+            true => STATE_ENS_EMPTY,
+            false => STATE_ENS_NOT_EMPTY,
+        };
+        self.state
+            .store(new_state, std::sync::atomic::Ordering::SeqCst);
+
+        Ok(is_empty)
+    }
 }
 
 #[async_trait::async_trait]
 impl SubgraphStoreTrait for SubgraphStore {
     fn ens_lookup(&self) -> Arc<dyn EnsLookupTrait> {
-        Arc::new(EnsLookup {
-            primary: self.mirror.primary().clone(),
-        })
+        Arc::new(EnsLookup::new(self.mirror.primary().clone()))
     }
 
     // FIXME: This method should not get a node_id
@@ -1264,6 +1360,18 @@ impl SubgraphStoreTrait for SubgraphStore {
         Ok(writable)
     }
 
+    async fn stop_subgraph(&self, loc: &DeploymentLocator) -> Result<(), StoreError> {
+        self.evict(&loc.hash)?;
+
+        // Remove the writable from the cache and stop it
+        let deployment = loc.id.into();
+        let writable = self.writables.lock().unwrap().remove(&deployment);
+        match writable {
+            Some(writable) => writable.stop().await,
+            None => Ok(()),
+        }
+    }
+
     fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError> {
         match self.site(id) {
             Ok(_) => Ok(true),
@@ -1293,6 +1401,17 @@ impl SubgraphStoreTrait for SubgraphStore {
             .collect())
     }
 
+    fn active_locator(&self, hash: &str) -> Result<Option<DeploymentLocator>, StoreError> {
+        let sites = self.mirror.find_sites(&[hash.to_string()], true)?;
+        if sites.len() > 1 {
+            return Err(constraint_violation!(
+                "There are {} active deployments for {hash}, there should only be one",
+                sites.len()
+            ));
+        }
+        Ok(sites.first().map(DeploymentLocator::from))
+    }
+
     async fn set_manifest_raw_yaml(
         &self,
         hash: &DeploymentHash,
@@ -1300,5 +1419,13 @@ impl SubgraphStoreTrait for SubgraphStore {
     ) -> Result<(), StoreError> {
         let (store, site) = self.store(hash)?;
         store.set_manifest_raw_yaml(site, raw_yaml).await
+    }
+
+    fn instrument(&self, deployment: &DeploymentLocator) -> Result<bool, StoreError> {
+        let site = self.find_site(deployment.id.into())?;
+        let store = self.for_site(&site)?;
+
+        let info = store.subgraph_info(&site)?;
+        Ok(info.instrument)
     }
 }

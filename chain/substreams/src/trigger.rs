@@ -1,14 +1,14 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 
 use anyhow::Error;
 use graph::{
-    blockchain::{self, block_stream::BlockWithTriggers, BlockPtr},
+    blockchain::{self, block_stream::BlockWithTriggers, BlockPtr, EmptyNodeCapabilities},
     components::{
-        store::{DeploymentLocator, EntityKey, SubgraphFork},
+        store::{DeploymentLocator, EntityKey, EntityType, SubgraphFork},
         subgraph::{MappingError, ProofOfIndexingEvent, SharedProofOfIndexing},
     },
     data::store::scalar::Bytes,
-    data_source,
+    data_source::{self, CausalityRegion},
     prelude::{
         anyhow, async_trait, BigDecimal, BigInt, BlockHash, BlockNumber, BlockState, Entity,
         RuntimeHostBuilder, Value,
@@ -19,11 +19,8 @@ use graph::{
 use graph_runtime_wasm::module::ToAscPtr;
 use lazy_static::__Deref;
 
-use crate::codec::Field;
-use crate::{
-    codec::{entity_change::Operation, field::Type},
-    Block, Chain, NodeCapabilities, NoopDataSourceTemplate,
-};
+use crate::codec;
+use crate::{codec::entity_change::Operation, Block, Chain, NoopDataSourceTemplate};
 
 #[derive(Eq, PartialEq, PartialOrd, Ord, Debug)]
 pub struct TriggerData {}
@@ -41,7 +38,7 @@ impl ToAscPtr for TriggerData {
         self,
         _heap: &mut H,
         _gas: &graph::runtime::gas::GasCounter,
-    ) -> Result<graph::runtime::AscPtr<()>, graph::runtime::DeterministicHostError> {
+    ) -> Result<graph::runtime::AscPtr<()>, graph::runtime::HostExportError> {
         unimplemented!()
     }
 }
@@ -77,7 +74,7 @@ impl blockchain::TriggerFilter<Chain> for TriggerFilter {
             return;
         }
 
-        if let Some(ref ds) = data_sources.next() {
+        if let Some(ds) = data_sources.next() {
             *data_sources_len = 1;
             *modules = ds.source.package.modules.clone();
             *module_name = ds.source.module_name.clone();
@@ -85,8 +82,8 @@ impl blockchain::TriggerFilter<Chain> for TriggerFilter {
         }
     }
 
-    fn node_capabilities(&self) -> NodeCapabilities {
-        NodeCapabilities {}
+    fn node_capabilities(&self) -> EmptyNodeCapabilities<Chain> {
+        EmptyNodeCapabilities::default()
     }
 
     fn to_firehose_filter(self) -> Vec<prost_types::Any> {
@@ -175,8 +172,9 @@ where
         causality_region: &str,
         _debug_fork: &Option<Arc<dyn SubgraphFork>>,
         _subgraph_metrics: &Arc<graph::prelude::SubgraphInstanceMetrics>,
+        _instrument: bool,
     ) -> Result<BlockState<Chain>, MappingError> {
-        for entity_change in block.entity_changes.iter() {
+        for entity_change in block.changes.entity_changes.iter() {
             match entity_change.operation() {
                 Operation::Unset => {
                     // Potentially an issue with the server side or
@@ -184,26 +182,31 @@ where
                     return Err(MappingError::Unknown(anyhow!("Detected UNSET entity operation, either a server error or there's a new type of operation and we're running an outdated protobuf")));
                 }
                 Operation::Create | Operation::Update => {
-                    // TODO(filipe): Remove this once the substreams GRPC has been fixed.
-                    let entity_type: &str = {
-                        let letter: String = entity_change.entity[0..1].to_uppercase();
-                        &(letter + &entity_change.entity[1..])
+                    let entity_type: &str = &entity_change.entity;
+                    let entity_id: String = entity_change.id.clone();
+                    let key = EntityKey {
+                        entity_type: EntityType::new(entity_type.to_string()),
+                        entity_id: entity_id.clone().into(),
+                        causality_region: CausalityRegion::ONCHAIN, // Substreams don't currently support offchain data
                     };
-                    let entity_id: String = String::from_utf8(entity_change.id.clone())
-                        .map_err(|e| MappingError::Unknown(anyhow::Error::from(e)))?;
-                    let key = EntityKey::data(entity_type.to_string(), entity_id.clone());
                     let mut data: HashMap<String, Value> = HashMap::from_iter(vec![]);
+
                     for field in entity_change.fields.iter() {
-                        let value: Value = decode_entity_change(&field, &entity_change.entity)?;
-                        *data
-                            .entry(field.name.as_str().to_owned())
-                            .or_insert(Value::Null) = value;
+                        let new_value: &codec::value::Typed = match &field.new_value {
+                            Some(codec::Value {
+                                typed: Some(new_value),
+                            }) => new_value,
+                            _ => continue,
+                        };
+
+                        let value: Value = decode_value(new_value)?;
+                        *data.entry(field.name.clone()).or_insert(Value::Null) = value;
                     }
 
                     write_poi_event(
                         proof_of_indexing,
                         &ProofOfIndexingEvent::SetEntity {
-                            entity_type: &entity_type,
+                            entity_type,
                             id: &entity_id,
                             data: &data,
                         },
@@ -215,9 +218,12 @@ where
                 }
                 Operation::Delete => {
                     let entity_type: &str = &entity_change.entity;
-                    let entity_id: String = String::from_utf8(entity_change.id.clone())
-                        .map_err(|e| MappingError::Unknown(anyhow::Error::from(e)))?;
-                    let key = EntityKey::data(entity_type.to_string(), entity_id.clone());
+                    let entity_id: String = entity_change.id.clone();
+                    let key = EntityKey {
+                        entity_type: EntityType::new(entity_type.to_string()),
+                        entity_id: entity_id.clone().into(),
+                        causality_region: CausalityRegion::ONCHAIN, // Substreams don't currently support offchain data
+                    };
 
                     state.entity_cache.remove(key);
 
@@ -238,89 +244,92 @@ where
     }
 }
 
-fn decode_entity_change(field: &Field, entity: &String) -> Result<Value, MappingError> {
-    match field.value_type() {
-        Type::Unset => {
-            return Err(MappingError::Unknown(anyhow!(
-                "Invalid field type, the protobuf probably needs updating"
-            )))
-        }
-        Type::Bigdecimal => match BigDecimal::parse_bytes(field.new_value.as_ref()) {
-            Some(bd) => Ok(Value::BigDecimal(bd)),
-            None => {
-                return Err(MappingError::Unknown(anyhow!(
-                    "Unable to parse BigDecimal for entity {}",
-                    entity
-                )))
+fn decode_value(value: &crate::codec::value::Typed) -> Result<Value, MappingError> {
+    use codec::value::Typed;
+
+    match value {
+        Typed::Int32(new_value) => Ok(Value::Int(*new_value)),
+
+        Typed::Bigdecimal(new_value) => BigDecimal::from_str(new_value)
+            .map(Value::BigDecimal)
+            .map_err(|err| MappingError::Unknown(anyhow::Error::from(err))),
+
+        Typed::Bigint(new_value) => BigInt::from_str(new_value)
+            .map(Value::BigInt)
+            .map_err(|err| MappingError::Unknown(anyhow::Error::from(err))),
+
+        Typed::String(new_value) => {
+            let mut string = new_value.clone();
+
+            // Strip null characters since they are not accepted by Postgres.
+            if string.contains('\u{0000}') {
+                string = string.replace('\u{0000}', "");
             }
-        },
-        Type::Bigint => Ok(Value::BigInt(BigInt::from_signed_bytes_be(
-            field.new_value.as_ref(),
-        ))),
-        Type::Int => {
-            let mut bytes: [u8; 8] = [0; 8];
-            bytes.copy_from_slice(field.new_value.as_ref());
-            Ok(Value::Int(i64::from_be_bytes(bytes) as i32))
+            Ok(Value::String(string))
         }
-        Type::Bytes => Ok(Value::Bytes(Bytes::from(field.new_value.as_ref()))),
-        Type::String => Ok(Value::String(
-            String::from_utf8(field.new_value.clone())
-                .map_err(|e| MappingError::Unknown(anyhow::Error::from(e)))?,
-        )),
+
+        Typed::Bytes(new_value) => base64::decode(new_value)
+            .map(|bs| Value::Bytes(Bytes::from(bs.as_ref())))
+            .map_err(|err| MappingError::Unknown(anyhow::Error::from(err))),
+
+        Typed::Bool(new_value) => Ok(Value::Bool(*new_value)),
+
+        Typed::Array(arr) => arr
+            .value
+            .iter()
+            .filter_map(|item| item.typed.as_ref().map(decode_value))
+            .collect::<Result<Vec<Value>, MappingError>>()
+            .map(Value::List),
     }
 }
 
 #[cfg(test)]
 mod test {
-    use std::str::FromStr;
+    use std::{ops::Add, str::FromStr};
 
-    use crate::codec::field::Type as FieldType;
-    use crate::codec::Field;
-    use crate::trigger::decode_entity_change;
+    use crate::codec::value::Typed;
+    use crate::codec::{Array, Value};
+    use crate::trigger::decode_value;
     use graph::{
         data::store::scalar::Bytes,
-        prelude::{BigDecimal, BigInt, Value},
+        prelude::{BigDecimal, BigInt, Value as GraphValue},
     };
 
     #[test]
     fn validate_substreams_field_types() {
         struct Case {
-            field: Field,
-            entity: String,
-            expected_new_value: Value,
+            name: String,
+            value: Value,
+            expected_value: GraphValue,
         }
 
         let cases = vec![
             Case {
-                field: Field {
-                    name: "setting string value".to_string(),
-                    value_type: FieldType::String as i32,
-                    new_value: Vec::from(
-                        "d4325ee72c39999e778a9908f5fb0803f78e30c441a5f2ce5c65eee0e0eba59d",
-                    ),
-                    new_value_null: false,
-                    old_value: Vec::from("".to_string()),
-                    old_value_null: true,
+                name: "string value".to_string(),
+                value: Value {
+                    typed: Some(Typed::String(
+                        "d4325ee72c39999e778a9908f5fb0803f78e30c441a5f2ce5c65eee0e0eba59d"
+                            .to_string(),
+                    )),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::String(
+                expected_value: GraphValue::String(
                     "d4325ee72c39999e778a9908f5fb0803f78e30c441a5f2ce5c65eee0e0eba59d".to_string(),
                 ),
             },
             Case {
-                field: Field {
-                    name: "settings bytes value".to_string(),
-                    value_type: FieldType::Bytes as i32,
-                    new_value: hex::decode(
-                        "445247fe150195bd866516594e087e1728294aa831613f4d48b8ec618908519f",
-                    )
-                    .unwrap(),
-                    new_value_null: false,
-                    old_value: Vec::from("".to_string()),
-                    old_value_null: true,
+                name: "bytes value".to_string(),
+                value: Value {
+                    typed: Some(Typed::Bytes(
+                        base64::encode(
+                            hex::decode(
+                                "445247fe150195bd866516594e087e1728294aa831613f4d48b8ec618908519f",
+                            )
+                            .unwrap(),
+                        )
+                        .into_bytes(),
+                    )),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::Bytes(
+                expected_value: GraphValue::Bytes(
                     Bytes::from_str(
                         "0x445247fe150195bd866516594e087e1728294aa831613f4d48b8ec618908519f",
                     )
@@ -328,122 +337,76 @@ mod test {
                 ),
             },
             Case {
-                field: Field {
-                    name: "setting int value for block 12369760".to_string(),
-                    value_type: FieldType::Int as i32,
-                    new_value: hex::decode("0000000000bcbf60").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "int value for block".to_string(),
+                value: Value {
+                    typed: Some(Typed::Int32(12369760)),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::Int(12369760),
+                expected_value: GraphValue::Int(12369760),
             },
             Case {
-                field: Field {
-                    name: "setting int value for block 12369622".to_string(),
-                    value_type: FieldType::Int as i32,
-                    new_value: hex::decode("0000000000bcbed6").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "negative int value".to_string(),
+                value: Value {
+                    typed: Some(Typed::Int32(-12369760)),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::Int(12369622),
+                expected_value: GraphValue::Int(-12369760),
             },
             Case {
-                field: Field {
-                    name: "setting int value for block 12369623".to_string(),
-                    value_type: FieldType::Int as i32,
-                    new_value: hex::decode("0000000000bcbed7").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "big int".to_string(),
+                value: Value {
+                    typed: Some(Typed::Bigint("123".to_string())),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::Int(12369623),
+                expected_value: GraphValue::BigInt(BigInt::from(123u64)),
             },
             Case {
-                field: Field {
-                    name: "setting big int transactions count of 123".to_string(),
-                    value_type: FieldType::Bigint as i32,
-                    new_value: hex::decode("7b").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "big int > u64".to_string(),
+                value: Value {
+                    typed: Some(Typed::Bigint(
+                        BigInt::from(u64::MAX).add(BigInt::from(1)).to_string(),
+                    )),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigInt(BigInt::from(123u64)),
+                expected_value: GraphValue::BigInt(BigInt::from(u64::MAX).add(BigInt::from(1))),
             },
             Case {
-                field: Field {
-                    name: "setting big int transactions count of 302".to_string(),
-                    value_type: FieldType::Bigint as i32,
-                    new_value: hex::decode("012e").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "big decimal value".to_string(),
+                value: Value {
+                    typed: Some(Typed::Bigdecimal("3133363633312e35".to_string())),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigInt(BigInt::from(302u64)),
+                expected_value: GraphValue::BigDecimal(BigDecimal::new(
+                    BigInt::from(3133363633312u64),
+                    35,
+                )),
             },
             Case {
-                field: Field {
-                    name: "setting big int transactions count of 209".to_string(),
-                    value_type: FieldType::Bigint as i32,
-                    new_value: hex::decode("00d1").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "bool value".to_string(),
+                value: Value {
+                    typed: Some(Typed::Bool(true)),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigInt(BigInt::from(209u64)),
+                expected_value: GraphValue::Bool(true),
             },
             Case {
-                field: Field {
-                    name: "setting big decimal value".to_string(),
-                    value_type: FieldType::Bigdecimal as i32,
-                    new_value: hex::decode("3133363633312e35").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
+                name: "string array".to_string(),
+                value: Value {
+                    typed: Some(Typed::Array(Array {
+                        value: vec![
+                            Value {
+                                typed: Some(Typed::String("1".to_string())),
+                            },
+                            Value {
+                                typed: Some(Typed::String("2".to_string())),
+                            },
+                            Value {
+                                typed: Some(Typed::String("3".to_string())),
+                            },
+                        ],
+                    })),
                 },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigDecimal(BigDecimal::from(136631.5)),
-            },
-            Case {
-                field: Field {
-                    name: "setting big decimal value 2".to_string(),
-                    value_type: FieldType::Bigdecimal as i32,
-                    new_value: hex::decode("3133303730392e30").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
-                },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigDecimal(BigDecimal::from(130709.0)),
-            },
-            Case {
-                field: Field {
-                    name: "setting big decimal value 3".to_string(),
-                    value_type: FieldType::Bigdecimal as i32,
-                    new_value: hex::decode("39373839322e36").unwrap(),
-                    new_value_null: false,
-                    old_value: vec![],
-                    old_value_null: true,
-                },
-                entity: "Block".to_string(),
-                expected_new_value: Value::BigDecimal(BigDecimal::new(BigInt::from(978926u64), -1)),
+                expected_value: GraphValue::List(vec!["1".into(), "2".into(), "3".into()]),
             },
         ];
 
         for case in cases.into_iter() {
-            let value: Value = decode_entity_change(&case.field, &case.entity).unwrap();
-            assert_eq!(
-                case.expected_new_value, value,
-                "failed case: {}",
-                case.field.name
-            )
+            let value: GraphValue = decode_value(&case.value.typed.unwrap()).unwrap();
+            assert_eq!(case.expected_value, value, "failed case: {}", case.name)
         }
     }
 }

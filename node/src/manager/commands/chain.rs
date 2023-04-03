@@ -11,6 +11,7 @@ use graph::{
     components::store::BlockStore as _, prelude::anyhow::Error, prelude::serde_json as json,
 };
 use graph_store_postgres::BlockStore;
+use graph_store_postgres::ChainStore;
 use graph_store_postgres::{
     command_support::catalog::block_store, connection_pool::ConnectionPool,
 };
@@ -49,6 +50,19 @@ pub async fn list(primary: ConnectionPool, store: Arc<BlockStore>) -> Result<(),
     Ok(())
 }
 
+pub async fn clear_call_cache(
+    chain_store: Arc<ChainStore>,
+    from: i32,
+    to: i32,
+) -> Result<(), Error> {
+    println!(
+        "Removing entries for blocks from {from} to {to} from the call cache for `{}`",
+        chain_store.chain
+    );
+    chain_store.clear_call_cache(from, to).await?;
+    Ok(())
+}
+
 pub async fn info(
     primary: ConnectionPool,
     store: Arc<BlockStore>,
@@ -57,7 +71,7 @@ pub async fn info(
     hashes: bool,
 ) -> Result<(), Error> {
     fn row(label: &str, value: impl std::fmt::Display) {
-        println!("{:<16} | {}", label, value.to_string());
+        println!("{:<16} | {}", label, value);
     }
 
     fn print_ptr(label: &str, ptr: Option<BlockPtr>, hashes: bool) {

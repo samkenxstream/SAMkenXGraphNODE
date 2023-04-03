@@ -21,7 +21,6 @@ use graph::{
 };
 use graph_store_postgres::layout_for_tests::Connection as Primary;
 use graph_store_postgres::SubgraphStore;
-
 use std::{collections::HashSet, marker::PhantomData, sync::Arc};
 use test_store::*;
 
@@ -114,7 +113,7 @@ fn create_subgraph() {
 
     // Return the versions (not deployments) for a subgraph
     fn subgraph_versions(primary: &Primary) -> (Option<String>, Option<String>) {
-        primary.versions_for_subgraph(&*SUBGRAPH_NAME).unwrap()
+        primary.versions_for_subgraph(SUBGRAPH_NAME).unwrap()
     }
 
     /// Return the deployment for the current and the pending version of the
@@ -137,7 +136,7 @@ fn create_subgraph() {
         let schema = Schema::parse(SUBGRAPH_GQL, id.clone()).unwrap();
 
         let manifest = SubgraphManifest::<graph_chain_ethereum::Chain> {
-            id: id.clone(),
+            id,
             spec_version: Version::new(1, 0, 0),
             features: Default::default(),
             description: None,
@@ -165,8 +164,7 @@ fn create_subgraph() {
         });
         let events = events
             .into_iter()
-            .map(|event| event.changes.into_iter())
-            .flatten()
+            .flat_map(|event| event.changes.into_iter())
             .collect();
         (deployment, events)
     }
@@ -463,7 +461,7 @@ fn version_info() {
         .unwrap();
 
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.synced);
         assert_eq!(false, vi.failed);
         assert_eq!(
@@ -474,9 +472,9 @@ fn version_info() {
             Some("repo for versionInfoSubgraph"),
             vi.repository.as_deref()
         );
-        assert_eq!(&*NAME, vi.schema.id.as_str());
+        assert_eq!(NAME, vi.schema.id.as_str());
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
-        assert_eq!(&*NETWORK_NAME, vi.network.as_str());
+        assert_eq!(NETWORK_NAME, vi.network.as_str());
         // We set the head for the network to null in the test framework
         assert_eq!(None, vi.total_ethereum_blocks_count);
     })
@@ -638,7 +636,7 @@ fn fail_unfail_deterministic_error() {
             .await
             .unwrap());
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -658,7 +656,7 @@ fn fail_unfail_deterministic_error() {
             .await
             .unwrap());
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -685,7 +683,7 @@ fn fail_unfail_deterministic_error() {
             .await
             .unwrap());
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -702,7 +700,7 @@ fn fail_unfail_deterministic_error() {
             .await
             .unwrap());
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -741,7 +739,7 @@ fn fail_unfail_deterministic_error_noop() {
         // We don't have any errors and the subgraph is healthy.
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -758,7 +756,7 @@ fn fail_unfail_deterministic_error_noop() {
         // Still no fatal errors.
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -778,7 +776,7 @@ fn fail_unfail_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -796,7 +794,7 @@ fn fail_unfail_deterministic_error_noop() {
         // Now we have a fatal error because the subgraph failed.
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -811,7 +809,7 @@ fn fail_unfail_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -838,7 +836,7 @@ fn fail_unfail_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 2);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -877,7 +875,7 @@ fn fail_unfail_non_deterministic_error() {
         // We don't have any errors.
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -901,7 +899,7 @@ fn fail_unfail_non_deterministic_error() {
         // Now we have a fatal error because the subgraph failed.
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -918,7 +916,7 @@ fn fail_unfail_non_deterministic_error() {
         // Subgraph failed but it's deployment head pointer advanced.
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -929,7 +927,7 @@ fn fail_unfail_non_deterministic_error() {
         assert_eq!(outcome, UnfailOutcome::Unfailed);
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -968,7 +966,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         // We don't have any errors and the subgraph is healthy.
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(0), vi.latest_ethereum_block_number);
 
@@ -985,7 +983,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         // Still no errors.
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -1002,7 +1000,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 0);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(false, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -1020,7 +1018,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         // We now have a fatal error because the subgraph failed.
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -1031,7 +1029,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 1);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 
@@ -1053,7 +1051,7 @@ fn fail_unfail_non_deterministic_error_noop() {
         assert_eq!(outcome, UnfailOutcome::Noop);
         assert_eq!(count(), 2);
         let vi = get_version_info(&store, NAME);
-        assert_eq!(&*NAME, vi.deployment_id.as_str());
+        assert_eq!(NAME, vi.deployment_id.as_str());
         assert_eq!(true, vi.failed);
         assert_eq!(Some(1), vi.latest_ethereum_block_number);
 

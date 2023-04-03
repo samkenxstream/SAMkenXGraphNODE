@@ -1,22 +1,26 @@
 use crate::{
-    components::{link_resolver::LinkResolver, store::BlockNumber},
+    components::{
+        link_resolver::LinkResolver,
+        store::{BlockNumber, DeploymentCursorTracker, DeploymentLocator},
+    },
+    data::subgraph::UnifiedMappingApiVersion,
     prelude::DataSourceTemplateInfo,
 };
 use anyhow::Error;
 use async_trait::async_trait;
-use core::fmt;
 use serde::Deserialize;
 use std::{convert::TryFrom, sync::Arc};
 
 use super::{
-    block_stream::{self, FirehoseCursor},
-    HostFn, IngestorError, TriggerWithHandler,
+    block_stream::{self, BlockStream, FirehoseCursor},
+    client::ChainClient,
+    BlockIngestor, EmptyNodeCapabilities, HostFn, IngestorError, TriggerWithHandler,
 };
 
 use super::{
     block_stream::BlockWithTriggers, Block, BlockPtr, Blockchain, BlockchainKind, DataSource,
-    DataSourceTemplate, NodeCapabilities, RuntimeAdapter, TriggerData, TriggerFilter,
-    TriggersAdapter, UnresolvedDataSource, UnresolvedDataSourceTemplate,
+    DataSourceTemplate, RuntimeAdapter, TriggerData, TriggerFilter, TriggersAdapter,
+    UnresolvedDataSource, UnresolvedDataSourceTemplate,
 };
 
 #[derive(Debug)]
@@ -49,6 +53,10 @@ impl<C: Blockchain> TryFrom<DataSourceTemplateInfo<C>> for MockDataSource {
 }
 
 impl<C: Blockchain> DataSource<C> for MockDataSource {
+    fn from_template_info(_template_info: DataSourceTemplateInfo<C>) -> Result<Self, Error> {
+        todo!()
+    }
+
     fn address(&self) -> Option<&[u8]> {
         todo!()
     }
@@ -240,21 +248,6 @@ impl<C: Blockchain> TriggerFilter<C> for MockTriggerFilter {
     }
 }
 
-#[derive(Debug)]
-pub struct MockNodeCapabilities;
-
-impl fmt::Display for MockNodeCapabilities {
-    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!()
-    }
-}
-
-impl<C: Blockchain> NodeCapabilities<C> for MockNodeCapabilities {
-    fn from_data_sources(_data_sources: &[C::DataSource]) -> Self {
-        todo!()
-    }
-}
-
 pub struct MockRuntimeAdapter;
 
 impl<C: Blockchain> RuntimeAdapter<C> for MockRuntimeAdapter {
@@ -267,6 +260,7 @@ impl<C: Blockchain> RuntimeAdapter<C> for MockRuntimeAdapter {
 impl Blockchain for MockBlockchain {
     const KIND: BlockchainKind = BlockchainKind::Ethereum;
 
+    type Client = ();
     type Block = MockBlock;
 
     type DataSource = MockDataSource;
@@ -283,7 +277,7 @@ impl Blockchain for MockBlockchain {
 
     type TriggerFilter = MockTriggerFilter;
 
-    type NodeCapabilities = MockNodeCapabilities;
+    type NodeCapabilities = EmptyNodeCapabilities<Self>;
 
     fn triggers_adapter(
         &self,
@@ -294,26 +288,26 @@ impl Blockchain for MockBlockchain {
         todo!()
     }
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
-        _deployment: crate::components::store::DeploymentLocator,
-        _block_cursor: FirehoseCursor,
-        _start_blocks: Vec<crate::components::store::BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: std::sync::Arc<Self::TriggerFilter>,
-        _unified_api_version: crate::data::subgraph::UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn block_stream::BlockStream<Self>>, anyhow::Error> {
+        _deployment: DeploymentLocator,
+        _store: impl DeploymentCursorTracker,
+        _start_blocks: Vec<BlockNumber>,
+        _filter: Arc<Self::TriggerFilter>,
+        _unified_api_version: UnifiedMappingApiVersion,
+    ) -> Result<Box<dyn BlockStream<Self>>, Error> {
         todo!()
     }
 
-    async fn new_polling_block_stream(
+    fn is_refetch_block_required(&self) -> bool {
+        false
+    }
+
+    async fn refetch_firehose_block(
         &self,
-        _deployment: crate::components::store::DeploymentLocator,
-        _start_blocks: Vec<crate::components::store::BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: std::sync::Arc<Self::TriggerFilter>,
-        _unified_api_version: crate::data::subgraph::UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn block_stream::BlockStream<Self>>, anyhow::Error> {
+        _logger: &slog::Logger,
+        _cursor: FirehoseCursor,
+    ) -> Result<MockBlock, Error> {
         todo!()
     }
 
@@ -333,7 +327,11 @@ impl Blockchain for MockBlockchain {
         todo!()
     }
 
-    fn is_firehose_supported(&self) -> bool {
+    fn chain_client(&self) -> Arc<ChainClient<MockBlockchain>> {
+        todo!()
+    }
+
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
         todo!()
     }
 }

@@ -239,6 +239,10 @@ impl Namespace {
         Ok(Namespace(s))
     }
 
+    pub fn prune(id: DeploymentId) -> Self {
+        Namespace(format!("prune{id}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -331,7 +335,7 @@ pub struct Site {
     /// Whether this is the site that should be used for queries. There's
     /// exactly one for each `deployment`, i.e., other entries for that
     /// deployment have `active = false`
-    pub(crate) active: bool,
+    pub active: bool,
 
     pub(crate) schema_version: DeploymentSchemaVersion,
     /// Only the store and tests can create Sites
@@ -363,6 +367,12 @@ impl TryFrom<Schema> for Site {
             schema_version,
             _creation_disallowed: (),
         })
+    }
+}
+
+impl std::fmt::Display for Site {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}[sgd{}]", self.deployment, self.id)
     }
 }
 
@@ -522,17 +532,15 @@ mod queries {
             } else {
                 ds::table.load::<Schema>(conn)?
             }
+        } else if only_active {
+            ds::table
+                .filter(ds::active)
+                .filter(ds::subgraph.eq_any(ids))
+                .load::<Schema>(conn)?
         } else {
-            if only_active {
-                ds::table
-                    .filter(ds::active)
-                    .filter(ds::subgraph.eq_any(ids))
-                    .load::<Schema>(conn)?
-            } else {
-                ds::table
-                    .filter(ds::subgraph.eq_any(ids))
-                    .load::<Schema>(conn)?
-            }
+            ds::table
+                .filter(ds::subgraph.eq_any(ids))
+                .load::<Schema>(conn)?
         };
         schemas
             .into_iter()
@@ -1269,7 +1277,7 @@ impl<'a> Connection<'a> {
         // Any shards that have no deployments in them will not be in
         // 'used'; add them in with a count of 0
         let missing = shards
-            .into_iter()
+            .iter()
             .filter(|shard| !used.iter().any(|(s, _)| s == shard.as_str()))
             .map(|shard| (shard.as_str(), 0));
 
@@ -1402,7 +1410,7 @@ impl<'a> Connection<'a> {
                 detail.latest_ethereum_block_number.clone(),
             )?
             .map(|b| b.to_ptr())
-            .map(|ptr| (Some(Vec::from(ptr.hash_slice())), Some(ptr.number as i32)))
+            .map(|ptr| (Some(Vec::from(ptr.hash_slice())), Some(ptr.number)))
             .unwrap_or((None, None));
             let entity_count = detail.entity_count.to_u64().unwrap_or(0) as i32;
 
@@ -1491,6 +1499,18 @@ impl<'a> Connection<'a> {
             .map_err(|e| anyhow!("error looking up ens_name for hash {}: {}", hash, e).into())
     }
 
+    pub fn is_ens_table_empty(&self) -> Result<bool, StoreError> {
+        use ens_names as dsl;
+
+        dsl::table
+            .select(dsl::name)
+            .limit(1)
+            .get_result::<String>(self.conn.as_ref())
+            .optional()
+            .map(|r| r.is_none())
+            .map_err(|e| anyhow!("error if ens table is empty: {}", e).into())
+    }
+
     pub fn record_active_copy(&self, src: &Site, dst: &Site) -> Result<(), StoreError> {
         use active_copies as cp;
 
@@ -1515,6 +1535,17 @@ impl<'a> Connection<'a> {
     }
 }
 
+/// Return `true` if we deem this installation to be empty, defined as
+/// having no deployments and no subgraph names in the database
+pub fn is_empty(conn: &PgConnection) -> Result<bool, StoreError> {
+    use deployment_schemas as ds;
+    use subgraph as s;
+
+    let empty = ds::table.count().get_result::<i64>(conn)? == 0
+        && s::table.count().get_result::<i64>(conn)? == 0;
+    Ok(empty)
+}
+
 /// A struct that reads from pools in order, trying each pool in turn until
 /// a query returns either success or anything but a
 /// `Err(StoreError::DatabaseUnavailable)`. This only works for tables that
@@ -1530,13 +1561,22 @@ impl Mirror {
             .expect("we always have a primary pool")
             .clone();
         let pools = pools
-            .into_iter()
+            .iter()
             .filter(|(shard, _)| *shard != &*PRIMARY_SHARD)
             .fold(vec![primary], |mut pools, (_, pool)| {
                 pools.push(pool.clone());
                 pools
             });
         Mirror { pools }
+    }
+
+    /// Create a mirror that only uses the primary. Such a mirror will not
+    /// be able to do anything if the primary is down, and should only be
+    /// used for non-critical uses like command line tools
+    pub fn primary_only(primary: ConnectionPool) -> Mirror {
+        Mirror {
+            pools: vec![primary],
+        }
     }
 
     /// Execute the function `f` with connections from each of our pools in
@@ -1583,19 +1623,25 @@ impl Mirror {
             "subgraph_version",
         ];
 
+        fn run_query(conn: &PgConnection, query: String) -> Result<(), StoreError> {
+            conn.batch_execute(&query).map_err(StoreError::from)
+        }
+
         fn copy_table(
             conn: &PgConnection,
             src_nsp: &str,
             dst_nsp: &str,
             table_name: &str,
         ) -> Result<(), StoreError> {
-            let query = format!(
-                "insert into {dst_nsp}.{table_name} select * from {src_nsp}.{table_name};",
-                src_nsp = src_nsp,
-                dst_nsp = dst_nsp,
-                table_name = table_name
-            );
-            conn.batch_execute(&query).map_err(StoreError::from)
+            run_query(
+                conn,
+                format!(
+                    "insert into {dst_nsp}.{table_name} select * from {src_nsp}.{table_name};",
+                    src_nsp = src_nsp,
+                    dst_nsp = dst_nsp,
+                    table_name = table_name
+                ),
+            )
         }
 
         let check_cancel = || {
@@ -1622,24 +1668,40 @@ impl Mirror {
         conn.batch_execute(&query)?;
         check_cancel()?;
 
+        // Repopulate `PUBLIC_TABLES` by copying their data wholesale
         for table_name in PUBLIC_TABLES {
             copy_table(
                 conn,
-                &*ForeignServer::PRIMARY_PUBLIC,
+                ForeignServer::PRIMARY_PUBLIC,
                 NAMESPACE_PUBLIC,
                 table_name,
             )?;
             check_cancel()?;
         }
-        for table_name in SUBGRAPHS_TABLES {
-            copy_table(
-                conn,
-                &ForeignServer::metadata_schema(&*PRIMARY_SHARD),
-                NAMESPACE_SUBGRAPHS,
-                table_name,
-            )?;
-            check_cancel()?;
-        }
+
+        // Repopulate `SUBGRAPHS_TABLES` but only copy the data we actually
+        // need to respond to queries when the primary is down
+        let src_nsp = ForeignServer::metadata_schema(&PRIMARY_SHARD);
+        let dst_nsp = NAMESPACE_SUBGRAPHS;
+
+        run_query(
+            conn,
+            format!(
+                "insert into {dst_nsp}.subgraph \
+                     select * from {src_nsp}.subgraph
+                     where current_version is not null;"
+            ),
+        )?;
+        run_query(
+            conn,
+            format!(
+                "insert into {dst_nsp}.subgraph_version \
+                 select v.* from {src_nsp}.subgraph_version v, {src_nsp}.subgraph s
+                  where v.id = s.current_version;"
+            ),
+        )?;
+        copy_table(conn, &src_nsp, dst_nsp, "subgraph_deployment_assignment")?;
+
         Ok(())
     }
 

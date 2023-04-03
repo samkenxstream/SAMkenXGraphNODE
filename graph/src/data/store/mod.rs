@@ -14,10 +14,7 @@ use std::convert::TryFrom;
 use std::fmt;
 use std::iter::FromIterator;
 use std::str::FromStr;
-use std::{
-    borrow::Cow,
-    collections::{BTreeMap, HashMap},
-};
+use std::{borrow::Cow, collections::HashMap};
 use strum::AsStaticRef as _;
 use strum_macros::AsStaticStr;
 
@@ -64,7 +61,7 @@ impl NodeId {
         let s = s.into();
 
         // Enforce minimum and maximum length limit
-        if s.len() > 63 || s.len() < 1 {
+        if s.len() > 63 || s.is_empty() {
             return Err(());
         }
 
@@ -655,7 +652,7 @@ impl Entity {
     pub fn id(&self) -> Result<String, Error> {
         match self.get("id") {
             None => Err(anyhow!("Entity is missing an `id` attribute")),
-            Some(Value::String(s)) => Ok(s.to_owned()),
+            Some(Value::String(s)) => Ok(s.clone()),
             Some(Value::Bytes(b)) => Ok(b.to_string()),
             _ => Err(anyhow!("Entity has non-string `id` attribute")),
         }
@@ -822,18 +819,6 @@ impl Entity {
     }
 }
 
-impl From<Entity> for BTreeMap<String, q::Value> {
-    fn from(entity: Entity) -> BTreeMap<String, q::Value> {
-        entity.0.into_iter().map(|(k, v)| (k, v.into())).collect()
-    }
-}
-
-impl From<Entity> for q::Value {
-    fn from(entity: Entity) -> q::Value {
-        q::Value::Object(entity.into())
-    }
-}
-
 impl From<HashMap<Attribute, Value>> for Entity {
     fn from(m: HashMap<Attribute, Value>) -> Entity {
         Entity(m)
@@ -935,22 +920,20 @@ fn entity_validation() {
         let key = EntityKey::data("Thing".to_owned(), id.clone());
 
         let err = thing.validate(&schema, &key);
-        if errmsg == "" {
+        if errmsg.is_empty() {
             assert!(
                 err.is_ok(),
                 "checking entity {}: expected ok but got {}",
                 id,
                 err.unwrap_err()
             );
+        } else if let Err(e) = err {
+            assert_eq!(errmsg, e.to_string(), "checking entity {}", id);
         } else {
-            if let Err(e) = err {
-                assert_eq!(errmsg, e.to_string(), "checking entity {}", id);
-            } else {
-                panic!(
-                    "Expected error `{}` but got ok when checking entity {}",
-                    errmsg, id
-                );
-            }
+            panic!(
+                "Expected error `{}` but got ok when checking entity {}",
+                errmsg, id
+            );
         }
     }
 

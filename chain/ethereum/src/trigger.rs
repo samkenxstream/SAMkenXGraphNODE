@@ -21,7 +21,7 @@ use graph::runtime::asc_new;
 use graph::runtime::gas::GasCounter;
 use graph::runtime::AscHeap;
 use graph::runtime::AscPtr;
-use graph::runtime::DeterministicHostError;
+use graph::runtime::HostExportError;
 use graph::semver::Version;
 use graph_runtime_wasm::module::ToAscPtr;
 use std::convert::TryFrom;
@@ -116,7 +116,7 @@ impl ToAscPtr for MappingTrigger {
         self,
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<AscPtr<()>, DeterministicHostError> {
+    ) -> Result<AscPtr<()>, HostExportError> {
         Ok(match self {
             MappingTrigger::Log {
                 block,
@@ -404,7 +404,7 @@ impl From<&'_ Transaction> for EthereumTransactionData {
             gas_limit: tx.gas,
             gas_price: tx.gas_price.unwrap_or(U256::zero()), // EIP-1559 made this optional.
             input: tx.input.0.clone(),
-            nonce: tx.nonce.clone(),
+            nonce: tx.nonce,
         }
     }
 }

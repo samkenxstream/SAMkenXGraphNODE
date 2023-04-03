@@ -32,6 +32,7 @@ mod primary;
 pub mod query_store;
 mod relational;
 mod relational_queries;
+mod retry;
 mod sql_value;
 mod store;
 mod store_events;
@@ -55,7 +56,7 @@ pub mod layout_for_tests {
 
 pub use self::block_store::BlockStore;
 pub use self::chain_head_listener::ChainHeadUpdateListener;
-pub use self::chain_store::ChainStore;
+pub use self::chain_store::{ChainStore, ChainStoreMetrics};
 pub use self::detail::DeploymentDetail;
 pub use self::jobs::register as register_jobs;
 pub use self::notification_listener::NotificationSender;
@@ -71,12 +72,16 @@ pub mod command_support {
         pub use crate::block_store::primary as block_store;
         pub use crate::catalog::{account_like, stats};
         pub use crate::copy::{copy_state, copy_table_state};
-        pub use crate::primary::Connection;
         pub use crate::primary::{
             active_copies, deployment_schemas, ens_names, subgraph, subgraph_deployment_assignment,
             subgraph_version, Site,
         };
+        pub use crate::primary::{Connection, Mirror};
     }
+    pub mod index {
+        pub use crate::relational::index::{CreateIndex, Method};
+    }
+    pub use crate::deployment::{on_sync, OnSync};
     pub use crate::primary::Namespace;
     pub use crate::relational::{Catalog, Column, ColumnType, Layout, SqlName};
 }

@@ -1,8 +1,11 @@
 use anyhow::Error;
 use graph::{
+    endpoint::EndpointMetrics,
     env::env_var,
-    prelude::{prost, tokio, tonic},
-    {firehose, firehose::FirehoseEndpoint, firehose::ForkStep},
+    firehose::SubgraphLimit,
+    log::logger,
+    prelude::{prost, tokio, tonic, MetricsRegistry},
+    {firehose, firehose::FirehoseEndpoint},
 };
 use graph_chain_ethereum::codec;
 use hex::ToHex;
@@ -15,17 +18,26 @@ async fn main() -> Result<(), Error> {
     let mut cursor: Option<String> = None;
     let token_env = env_var("SF_API_TOKEN", "".to_string());
     let mut token: Option<String> = None;
-    if token_env.len() > 0 {
+    if !token_env.is_empty() {
         token = Some(token_env);
     }
 
+    let logger = logger(false);
+    let host = "https://api.streamingfast.io:443".to_string();
+    let metrics = Arc::new(EndpointMetrics::new(
+        logger,
+        &[host.clone()],
+        Arc::new(MetricsRegistry::mock()),
+    ));
+
     let firehose = Arc::new(FirehoseEndpoint::new(
         "firehose",
-        "https://api.streamingfast.io:443",
+        &host,
         token,
         false,
         false,
-        1,
+        SubgraphLimit::Unlimited,
+        metrics,
     ));
 
     loop {
@@ -35,11 +47,11 @@ async fn main() -> Result<(), Error> {
             .stream_blocks(firehose::Request {
                 start_block_num: 12369739,
                 stop_block_num: 12369739,
-                start_cursor: match &cursor {
+                cursor: match &cursor {
                     Some(c) => c.clone(),
                     None => String::from(""),
                 },
-                fork_steps: vec![ForkStep::StepNew as i32, ForkStep::StepUndo as i32],
+                final_blocks_only: false,
                 ..Default::default()
             })
             .await
@@ -87,7 +99,7 @@ async fn main() -> Result<(), Error> {
                             })
                         });
 
-                        if logs.len() > 0 {
+                        if !logs.is_empty() {
                             println!("Transaction {}", trx.hash.encode_hex::<String>());
                             logs.iter().for_each(|log| println!("{}", log));
                         }

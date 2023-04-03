@@ -1,4 +1,10 @@
+pub mod causality_region;
 pub mod offchain;
+
+pub use causality_region::CausalityRegion;
+
+#[cfg(test)]
+mod tests;
 
 use crate::{
     blockchain::{
@@ -7,8 +13,7 @@ use crate::{
     },
     components::{
         link_resolver::LinkResolver,
-        store::{BlockNumber, StoredDynamicDataSource},
-        subgraph::DataSourceTemplateInfo,
+        store::{BlockNumber, EntityType, StoredDynamicDataSource},
     },
     data_source::offchain::OFFCHAIN_KINDS,
     prelude::{CheapClone as _, DataSourceContext},
@@ -18,6 +23,7 @@ use semver::Version;
 use serde::{de::IntoDeserializer as _, Deserialize, Deserializer};
 use slog::{Logger, SendSyncRefUnwindSafeKV};
 use std::{collections::BTreeMap, fmt, sync::Arc};
+use thiserror::Error;
 
 #[derive(Debug)]
 pub enum DataSource<C: Blockchain> {
@@ -25,17 +31,49 @@ pub enum DataSource<C: Blockchain> {
     Offchain(offchain::DataSource),
 }
 
-impl<C: Blockchain> TryFrom<DataSourceTemplateInfo<C>> for DataSource<C> {
-    type Error = Error;
+#[derive(Error, Debug)]
+pub enum DataSourceCreationError {
+    /// The creation of the data source should be ignored.
+    #[error("ignoring data source creation due to invalid parameter: '{0}', error: {1:#}")]
+    Ignore(String, Error),
 
-    fn try_from(info: DataSourceTemplateInfo<C>) -> Result<Self, Self::Error> {
-        match &info.template {
-            DataSourceTemplate::Onchain(_) => {
-                C::DataSource::try_from(info).map(DataSource::Onchain)
+    /// Other errors.
+    #[error("error creating data source: {0:#}")]
+    Unknown(#[from] Error),
+}
+
+/// Which entity types a data source can read and write to.
+///
+/// Currently this is only enforced on offchain data sources and templates, based on the `entities`
+/// key in the manifest. This informs which entity tables need an explicit `causality_region` column
+/// and which will always have `causality_region == 0`.
+///
+/// Note that this is just an optimization and not sufficient for causality region isolation, since
+/// generally the causality region is a property of the entity, not of the entity type.
+///
+/// See also: entity-type-access
+pub enum EntityTypeAccess {
+    Any,
+    Restriced(Vec<EntityType>),
+}
+
+impl fmt::Display for EntityTypeAccess {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        match self {
+            Self::Any => write!(f, "Any"),
+            Self::Restriced(entities) => {
+                let strings = entities.iter().map(|e| e.as_str()).collect::<Vec<_>>();
+                write!(f, "{}", strings.join(", "))
             }
-            DataSourceTemplate::Offchain(_) => {
-                offchain::DataSource::try_from(info).map(DataSource::Offchain)
-            }
+        }
+    }
+}
+
+impl EntityTypeAccess {
+    pub fn allows(&self, entity_type: &EntityType) -> bool {
+        match self {
+            Self::Any => true,
+            Self::Restriced(types) => types.contains(entity_type),
         }
     }
 }
@@ -43,7 +81,7 @@ impl<C: Blockchain> TryFrom<DataSourceTemplateInfo<C>> for DataSource<C> {
 impl<C: Blockchain> DataSource<C> {
     pub fn as_onchain(&self) -> Option<&C::DataSource> {
         match self {
-            Self::Onchain(ds) => Some(&ds),
+            Self::Onchain(ds) => Some(ds),
             Self::Offchain(_) => None,
         }
     }
@@ -51,7 +89,7 @@ impl<C: Blockchain> DataSource<C> {
     pub fn as_offchain(&self) -> Option<&offchain::DataSource> {
         match self {
             Self::Onchain(_) => None,
-            Self::Offchain(ds) => Some(&ds),
+            Self::Offchain(ds) => Some(ds),
         }
     }
 
@@ -104,6 +142,15 @@ impl<C: Blockchain> DataSource<C> {
         }
     }
 
+    pub fn entities(&self) -> EntityTypeAccess {
+        match self {
+            // Note: Onchain data sources have an `entities` field in the manifest, but it has never
+            // been enforced.
+            Self::Onchain(_) => EntityTypeAccess::Any,
+            Self::Offchain(ds) => EntityTypeAccess::Restriced(ds.mapping.entities.clone()),
+        }
+    }
+
     pub fn match_and_decode(
         &self,
         trigger: &TriggerData<C>,
@@ -125,10 +172,7 @@ impl<C: Blockchain> DataSource<C> {
     pub fn is_duplicate_of(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Onchain(a), Self::Onchain(b)) => a.is_duplicate_of(b),
-            (Self::Offchain(a), Self::Offchain(b)) => {
-                // See also: data-source-is-duplicate-of
-                a.manifest_idx == b.manifest_idx && a.source == b.source && a.context == b.context
-            }
+            (Self::Offchain(a), Self::Offchain(b)) => a.is_duplicate_of(b),
             _ => false,
         }
     }
@@ -162,6 +206,13 @@ impl<C: Blockchain> DataSource<C> {
             Self::Offchain(_) => vec![],
         }
     }
+
+    pub fn causality_region(&self) -> CausalityRegion {
+        match self {
+            Self::Onchain(_) => CausalityRegion::ONCHAIN,
+            Self::Offchain(ds) => ds.causality_region,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -182,10 +233,12 @@ impl<C: Blockchain> UnresolvedDataSource<C> {
                 .resolve(resolver, logger, manifest_idx)
                 .await
                 .map(DataSource::Onchain),
-            Self::Offchain(unresolved) => unresolved
-                .resolve(resolver, logger, manifest_idx)
-                .await
-                .map(DataSource::Offchain),
+            Self::Offchain(_unresolved) => {
+                anyhow::bail!(
+                    "static file data sources are not yet supported, \\
+                     for details see https://github.com/graphprotocol/graph-node/issues/3864"
+                );
+            }
         }
     }
 }
@@ -201,6 +254,13 @@ impl<C: Blockchain> DataSourceTemplate<C> {
         match self {
             Self::Onchain(ds) => Some(ds),
             Self::Offchain(_) => None,
+        }
+    }
+
+    pub fn as_offchain(&self) -> Option<&offchain::DataSourceTemplate> {
+        match self {
+            Self::Onchain(_) => None,
+            Self::Offchain(t) => Some(t),
         }
     }
 

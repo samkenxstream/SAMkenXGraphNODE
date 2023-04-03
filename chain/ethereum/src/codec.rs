@@ -4,7 +4,7 @@ mod pbcodec;
 
 use anyhow::format_err;
 use graph::{
-    blockchain::{Block as BlockchainBlock, BlockPtr},
+    blockchain::{Block as BlockchainBlock, BlockPtr, ChainStoreBlock, ChainStoreData},
     prelude::{
         web3,
         web3::types::{Bytes, H160, H2048, H256, H64, U256, U64},
@@ -36,9 +36,9 @@ impl TryDecodeProto<[u8; 256], H2048> for &[u8] {}
 impl TryDecodeProto<[u8; 32], H256> for &[u8] {}
 impl TryDecodeProto<[u8; 20], H160> for &[u8] {}
 
-impl Into<web3::types::U256> for &BigInt {
-    fn into(self) -> web3::types::U256 {
-        web3::types::U256::from_big_endian(&self.bytes)
+impl From<&BigInt> for web3::types::U256 {
+    fn from(val: &BigInt) -> Self {
+        web3::types::U256::from_big_endian(&val.bytes)
     }
 }
 
@@ -97,9 +97,9 @@ impl TryInto<web3::types::Call> for Call {
     }
 }
 
-impl Into<web3::types::CallType> for CallType {
-    fn into(self) -> web3::types::CallType {
-        match self {
+impl From<CallType> for web3::types::CallType {
+    fn from(val: CallType) -> Self {
+        match val {
             CallType::Unspecified => web3::types::CallType::None,
             CallType::Call => web3::types::CallType::Call,
             CallType::Callcode => web3::types::CallType::CallCode,
@@ -149,9 +149,9 @@ impl<'a> TryInto<web3::types::Log> for LogAt<'a> {
     }
 }
 
-impl Into<web3::types::U64> for TransactionTraceStatus {
-    fn into(self) -> web3::types::U64 {
-        let status: Option<web3::types::U64> = self.into();
+impl From<TransactionTraceStatus> for web3::types::U64 {
+    fn from(val: TransactionTraceStatus) -> Self {
+        let status: Option<web3::types::U64> = val.into();
         status.unwrap_or_else(|| web3::types::U64::from(0))
     }
 }
@@ -195,7 +195,19 @@ impl<'a> TryInto<web3::types::Transaction> for TransactionTraceAt<'a> {
                     .from
                     .try_decode_proto("transaction from address")?,
             ),
-            to: Some(self.trace.to.try_decode_proto("transaction to address")?),
+            to: match self.trace.calls.len() {
+                0 => Some(self.trace.to.try_decode_proto("transaction to address")?),
+                _ => {
+                    match CallType::from_i32(self.trace.calls[0].call_type).ok_or_else(|| {
+                        format_err!("invalid call type: {}", self.trace.calls[0].call_type,)
+                    })? {
+                        CallType::Create => {
+                            None // we don't want the 'to' address on a transaction that creates the contract, to align with RPC behavior
+                        }
+                        _ => Some(self.trace.to.try_decode_proto("transaction to")?),
+                    }
+                }
+            },
             value: self.trace.value.as_ref().map_or(U256::zero(), |x| x.into()),
             gas_price: self.trace.gas_price.as_ref().map(|x| x.into()),
             gas: U256::from(self.trace.gas_limit),
@@ -244,27 +256,30 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                     receipts_root: header.receipt_root.try_decode_proto("receipt root")?,
                     gas_used: U256::from(header.gas_used),
                     gas_limit: U256::from(header.gas_limit),
-                    base_fee_per_gas: None,
+                    base_fee_per_gas: Some(
+                        header
+                            .base_fee_per_gas
+                            .as_ref()
+                            .map_or_else(U256::default, |v| v.into()),
+                    ),
                     extra_data: Bytes::from(header.extra_data.clone()),
                     logs_bloom: match &header.logs_bloom.len() {
                         0 => None,
                         _ => Some(header.logs_bloom.try_decode_proto("logs bloom")?),
                     },
-                    timestamp: U256::from(
-                        header
-                            .timestamp
-                            .as_ref()
-                            .map_or_else(|| U256::default(), |v| U256::from(v.seconds)),
-                    ),
+                    timestamp: header
+                        .timestamp
+                        .as_ref()
+                        .map_or_else(U256::default, |v| U256::from(v.seconds)),
                     difficulty: header
                         .difficulty
                         .as_ref()
-                        .map_or_else(|| U256::default(), |v| v.into()),
+                        .map_or_else(U256::default, |v| v.into()),
                     total_difficulty: Some(
                         header
                             .total_difficulty
                             .as_ref()
-                            .map_or_else(|| U256::default(), |v| v.into()),
+                            .map_or_else(U256::default, |v| v.into()),
                     ),
                     // FIXME (SF): Firehose does not have seal fields, are they really used? Might be required for POA chains only also, I've seen that stuff on xDai (is this important?)
                     seal_fields: vec![],
@@ -276,7 +291,7 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                     transactions: self
                         .transaction_traces
                         .iter()
-                        .map(|t| TransactionTraceAt::new(t, &self).try_into())
+                        .map(|t| TransactionTraceAt::new(t, self).try_into())
                         .collect::<Result<Vec<web3::types::Transaction>, Error>>()?,
                     size: Some(U256::from(self.size)),
                     mix_hash: Some(header.mix_hash.try_decode_proto("mix hash")?),
@@ -321,7 +336,7 @@ impl TryInto<EthereumBlockWithCalls> for &Block {
                                 logs: r
                                     .logs
                                     .iter()
-                                    .map(|l| LogAt::new(l, &self, t).try_into())
+                                    .map(|l| LogAt::new(l, self, t).try_into())
                                     .collect::<Result<Vec<_>, Error>>()?,
                                 status: TransactionTraceStatus::from_i32(t.status)
                                     .ok_or_else(|| {
@@ -426,11 +441,38 @@ impl BlockchainBlock for Block {
     fn parent_ptr(&self) -> Option<BlockPtr> {
         self.parent_ptr()
     }
+
+    // This implementation provides the timestamp so that it works with block _meta's timestamp.
+    // However, the firehose types will not populate the transaction receipts so switching back
+    // from firehose ingestor to the firehose ingestor will prevent non final block from being
+    // processed using the block stored by firehose.
+    fn data(&self) -> Result<jsonrpc_core::serde_json::Value, jsonrpc_core::serde_json::Error> {
+        self.header().to_json()
+    }
 }
 
 impl HeaderOnlyBlock {
     pub fn header(&self) -> &BlockHeader {
         self.header.as_ref().unwrap()
+    }
+}
+
+impl From<&BlockHeader> for ChainStoreData {
+    fn from(val: &BlockHeader) -> Self {
+        ChainStoreData {
+            block: ChainStoreBlock::new(
+                val.timestamp.as_ref().unwrap().seconds,
+                jsonrpc_core::Value::Null,
+            ),
+        }
+    }
+}
+
+impl BlockHeader {
+    fn to_json(&self) -> Result<jsonrpc_core::serde_json::Value, jsonrpc_core::serde_json::Error> {
+        let chain_store_data: ChainStoreData = self.into();
+
+        jsonrpc_core::to_value(chain_store_data)
     }
 }
 
@@ -451,5 +493,44 @@ impl BlockchainBlock for HeaderOnlyBlock {
 
     fn parent_ptr(&self) -> Option<BlockPtr> {
         self.header().parent_ptr()
+    }
+
+    // This implementation provides the timestamp so that it works with block _meta's timestamp.
+    // However, the firehose types will not populate the transaction receipts so switching back
+    // from firehose ingestor to the firehose ingestor will prevent non final block from being
+    // processed using the block stored by firehose.
+    fn data(&self) -> Result<jsonrpc_core::serde_json::Value, jsonrpc_core::serde_json::Error> {
+        self.header().to_json()
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use graph::{blockchain::Block as _, prelude::chrono::Utc};
+    use prost_types::Timestamp;
+
+    use crate::codec::BlockHeader;
+
+    use super::Block;
+
+    #[test]
+    fn ensure_block_serialization() {
+        let now = Utc::now().timestamp();
+        let mut block = Block::default();
+        let mut header = BlockHeader::default();
+        header.timestamp = Some(Timestamp {
+            seconds: now,
+            nanos: 0,
+        });
+
+        block.header = Some(header);
+
+        let str_block = block.data().unwrap().to_string();
+
+        assert_eq!(
+            str_block,
+            // if you're confused when reading this, format needs {{ to escape {
+            format!(r#"{{"block":{{"data":null,"timestamp":"{}"}}}}"#, now)
+        );
     }
 }

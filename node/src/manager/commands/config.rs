@@ -2,18 +2,18 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use graph::{
     anyhow::bail,
-    components::metrics::MetricsRegistry,
+    endpoint::EndpointMetrics,
     itertools::Itertools,
     prelude::{
         anyhow::{anyhow, Error},
-        NodeId,
+        MetricsRegistry, NodeId,
     },
     slog::Logger,
 };
-use graph_chain_ethereum::{EthereumAdapterTrait, NodeCapabilities};
+use graph_chain_ethereum::{NodeCapabilities, ProviderEthRpcMetrics};
 use graph_store_postgres::DeploymentPlacer;
 
-use crate::config::Config;
+use crate::{chain::create_ethereum_networks_for_chain, config::Config};
 
 pub fn place(placer: &dyn DeploymentPlacer, name: &str, network: &str) -> Result<(), Error> {
     match placer.place(name, network).map_err(|s| anyhow!(s))? {
@@ -54,7 +54,7 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
     let nodes: Vec<_> = nodes
         .into_iter()
         .map(|name| {
-            NodeId::new(name.replace("-", "_"))
+            NodeId::new(name.replace('-', "_"))
                 .map_err(|()| anyhow!("illegal node name `{}`", name))
         })
         .collect::<Result<_, _>>()?;
@@ -100,7 +100,7 @@ pub fn pools(config: &Config, nodes: Vec<String>, shard: bool) -> Result<(), Err
 pub async fn provider(
     logger: Logger,
     config: &Config,
-    registry: Arc<dyn MetricsRegistry>,
+    registry: Arc<MetricsRegistry>,
     features: String,
     network: String,
 ) -> Result<(), Error> {
@@ -120,9 +120,11 @@ pub async fn provider(
         Ok(caps)
     }
 
+    let metrics = Arc::new(EndpointMetrics::mock());
     let caps = caps_from_features(features)?;
+    let eth_rpc_metrics = Arc::new(ProviderEthRpcMetrics::new(registry));
     let networks =
-        crate::manager::commands::run::create_ethereum_networks(logger, registry, config, &network)
+        create_ethereum_networks_for_chain(&logger, eth_rpc_metrics, config, &network, metrics)
             .await?;
     let adapters = networks
         .networks

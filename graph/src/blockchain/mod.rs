@@ -3,9 +3,13 @@
 //! trait which is the centerpiece of this module.
 
 pub mod block_stream;
+mod builder;
+pub mod client;
+mod empty_node_capabilities;
 pub mod firehose_block_ingestor;
 pub mod firehose_block_stream;
 pub mod mock;
+mod noop_runtime_adapter;
 pub mod polling_block_stream;
 pub mod substreams_block_stream;
 mod types;
@@ -13,7 +17,7 @@ mod types;
 // Try to reexport most of the necessary types
 use crate::{
     cheap_clone::CheapClone,
-    components::store::{DeploymentLocator, StoredDynamicDataSource},
+    components::store::{DeploymentCursorTracker, DeploymentLocator, StoredDynamicDataSource},
     data::subgraph::UnifiedMappingApiVersion,
     data_source,
     prelude::DataSourceContext,
@@ -34,7 +38,6 @@ use slog::Logger;
 use std::{
     any::Any,
     collections::HashMap,
-    convert::TryFrom,
     fmt::{self, Debug},
     str::FromStr,
     sync::Arc,
@@ -42,9 +45,21 @@ use std::{
 use web3::types::H256;
 
 pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersAdapter};
+pub use builder::{BasicBlockchainBuilder, BlockchainBuilder};
+pub use empty_node_capabilities::EmptyNodeCapabilities;
+pub use noop_runtime_adapter::NoopRuntimeAdapter;
 pub use types::{BlockHash, BlockPtr, ChainIdentifier};
 
-use self::block_stream::{BlockStream, FirehoseCursor};
+use self::{
+    block_stream::{BlockStream, FirehoseCursor},
+    client::ChainClient,
+};
+
+#[async_trait]
+pub trait BlockIngestor: 'static + Send + Sync {
+    async fn run(self: Box<Self>);
+    fn network_name(&self) -> String;
+}
 
 pub trait TriggersAdapterSelector<C: Blockchain>: Sync + Send {
     fn triggers_adapter(
@@ -72,10 +87,63 @@ pub trait Block: Send + Sync {
     }
 
     /// The data that should be stored for this block in the `ChainStore`
+    /// TODO: Return ChainStoreData once it is available for all chains
     fn data(&self) -> Result<serde_json::Value, serde_json::Error> {
         Ok(serde_json::Value::Null)
     }
 }
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// This is the root data for the chain store. This stucture provides backwards
+/// compatibility with existing data for ethereum.
+pub struct ChainStoreData {
+    pub block: ChainStoreBlock,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+/// ChainStoreBlock is intended to standardize the information stored in the data
+/// field of the ChainStore. All the chains should eventually return this type
+/// on the data() implementation for block. This will ensure that any part of the
+/// structured data can be relied upon for all chains.
+pub struct ChainStoreBlock {
+    /// Unix timestamp (seconds since epoch), can be stored as hex or decimal.
+    timestamp: String,
+    data: serde_json::Value,
+}
+
+impl ChainStoreBlock {
+    pub fn new(unix_timestamp: i64, data: serde_json::Value) -> Self {
+        Self {
+            timestamp: unix_timestamp.to_string(),
+            data,
+        }
+    }
+
+    pub fn timestamp_str(&self) -> &str {
+        &self.timestamp
+    }
+
+    pub fn timestamp(&self) -> i64 {
+        let (rdx, i) = if self.timestamp.starts_with("0x") {
+            (16, 2)
+        } else {
+            (10, 0)
+        };
+
+        i64::from_str_radix(&self.timestamp[i..], rdx).unwrap_or(0)
+    }
+}
+
+// // ChainClient represents the type of client used to ingest data from the chain. For most chains
+// // this will be either firehose or some sort of rpc client.
+// // If a specific chain requires more than one adapter this should be handled by the chain specifically
+// // as it's not common behavior across chains.
+// pub enum ChainClient<C: Blockchain> {
+//     Firehose(FirehoseEndpoints),
+//     Rpc(C::Client),
+// }
 
 #[async_trait]
 // This is only `Debug` because some tests require that
@@ -83,9 +151,11 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
     const KIND: BlockchainKind;
     const ALIASES: &'static [&'static str] = &[];
 
+    type Client: Debug + Default + Sync + Send;
     // The `Clone` bound is used when reprocessing a block, because `triggers_in_block` requires an
     // owned `Block`. It would be good to come up with a way to remove this bound.
     type Block: Block + Clone + Debug + Default;
+
     type DataSource: DataSource<Self>;
     type UnresolvedDataSource: UnresolvedDataSource<Self>;
 
@@ -111,21 +181,11 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Arc<dyn TriggersAdapter<Self>>, Error>;
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: FirehoseCursor,
+        store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
-        filter: Arc<Self::TriggerFilter>,
-        unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn BlockStream<Self>>, Error>;
-
-    async fn new_polling_block_stream(
-        &self,
-        deployment: DeploymentLocator,
-        start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error>;
@@ -138,9 +198,19 @@ pub trait Blockchain: Debug + Sized + Send + Sync + Unpin + 'static {
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError>;
 
+    async fn refetch_firehose_block(
+        &self,
+        logger: &Logger,
+        cursor: FirehoseCursor,
+    ) -> Result<Self::Block, Error>;
+
+    fn is_refetch_block_required(&self) -> bool;
+
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapter<Self>>;
 
-    fn is_firehose_supported(&self) -> bool;
+    fn chain_client(&self) -> Arc<ChainClient<Self>>;
+
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>>;
 }
 
 #[derive(Error, Debug)]
@@ -184,9 +254,14 @@ pub trait TriggerFilter<C: Blockchain>: Default + Clone + Send + Sync {
     fn to_firehose_filter(self) -> Vec<prost_types::Any>;
 }
 
-pub trait DataSource<C: Blockchain>:
-    'static + Sized + Send + Sync + Clone + TryFrom<DataSourceTemplateInfo<C>, Error = anyhow::Error>
-{
+pub trait DataSource<C: Blockchain>: 'static + Sized + Send + Sync + Clone {
+    fn from_template_info(info: DataSourceTemplateInfo<C>) -> Result<Self, Error>;
+
+    fn from_stored_dynamic_data_source(
+        template: &C::DataSourceTemplate,
+        stored: StoredDynamicDataSource,
+    ) -> Result<Self, Error>;
+
     fn address(&self) -> Option<&[u8]>;
     fn start_block(&self) -> BlockNumber;
     fn name(&self) -> &str;
@@ -218,11 +293,6 @@ pub trait DataSource<C: Blockchain>:
     fn is_duplicate_of(&self, other: &Self) -> bool;
 
     fn as_stored_dynamic_data_source(&self) -> StoredDynamicDataSource;
-
-    fn from_stored_dynamic_data_source(
-        template: &C::DataSourceTemplate,
-        stored: StoredDynamicDataSource,
-    ) -> Result<Self, Error>;
 
     /// Used as part of manifest validation. If there are no errors, return an empty vector.
     fn validate(&self) -> Vec<Error>;

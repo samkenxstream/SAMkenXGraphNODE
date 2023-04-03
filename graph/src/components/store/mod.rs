@@ -1,29 +1,34 @@
-mod cache;
+mod entity_cache;
 mod err;
 mod traits;
 
-pub use cache::{CachedEthereumCall, EntityCache, ModificationsAndCache};
+pub use entity_cache::{EntityCache, ModificationsAndCache};
+
+use diesel::types::{FromSql, ToSql};
 pub use err::StoreError;
 use itertools::Itertools;
+use strum_macros::Display;
 pub use traits::*;
 
 use futures::stream::poll_fn;
 use futures::{Async, Poll, Stream};
 use graphql_parser::schema as s;
 use serde::{Deserialize, Serialize};
+use std::borrow::Borrow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::fmt;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
+use std::{fmt, io};
 
-use crate::blockchain::{Block, Blockchain};
+use crate::blockchain::Block;
 use crate::data::store::scalar::Bytes;
 use crate::data::store::*;
 use crate::data::value::Word;
-use crate::prelude::*;
+use crate::data_source::CausalityRegion;
+use crate::{constraint_violation, prelude::*};
 
 /// The type name of an entity. This is the string that is used in the
 /// subgraph's GraphQL schema as `type NAME @entity { .. }`
@@ -59,13 +64,19 @@ impl fmt::Display for EntityType {
 
 impl<'a> From<&s::ObjectType<'a, String>> for EntityType {
     fn from(object_type: &s::ObjectType<'a, String>) -> Self {
-        EntityType::new(object_type.name.to_owned())
+        EntityType::new(object_type.name.clone())
     }
 }
 
 impl<'a> From<&s::InterfaceType<'a, String>> for EntityType {
     fn from(interface_type: &s::InterfaceType<'a, String>) -> Self {
-        EntityType::new(interface_type.name.to_owned())
+        EntityType::new(interface_type.name.clone())
+    }
+}
+
+impl Borrow<str> for EntityType {
+    fn borrow(&self) -> &str {
+        &self.0
     }
 }
 
@@ -79,6 +90,22 @@ impl From<&str> for EntityType {
 }
 
 impl CheapClone for EntityType {}
+
+impl FromSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        let s = <String as FromSql<_, diesel::pg::Pg>>::from_sql(bytes)?;
+        Ok(EntityType::new(s))
+    }
+}
+
+impl ToSql<diesel::sql_types::Text, diesel::pg::Pg> for EntityType {
+    fn to_sql<W: io::Write>(
+        &self,
+        out: &mut diesel::serialize::Output<W, diesel::pg::Pg>,
+    ) -> diesel::serialize::Result {
+        <str as ToSql<diesel::sql_types::Text, diesel::pg::Pg>>::to_sql(self.0.as_str(), out)
+    }
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EntityFilterDerivative(bool);
@@ -102,13 +129,66 @@ pub struct EntityKey {
 
     /// ID of the individual entity.
     pub entity_id: Word,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadRelatedRequest {
+    /// Name of the entity type.
+    pub entity_type: EntityType,
+    /// ID of the individual entity.
+    pub entity_id: Word,
+    /// Field the shall be loaded
+    pub entity_field: Word,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
+}
+
+#[derive(Debug)]
+pub struct DerivedEntityQuery {
+    /// Name of the entity to search
+    pub entity_type: EntityType,
+    /// The field to check
+    pub entity_field: Word,
+    /// The value to compare against
+    pub value: Word,
+
+    /// This is the causality region of the data source that created the entity.
+    ///
+    /// In the case of an entity lookup, this is the causality region of the data source that is
+    /// doing the lookup. So if the entity exists but was created on a different causality region,
+    /// the lookup will return empty.
+    pub causality_region: CausalityRegion,
 }
 
 impl EntityKey {
-    pub fn data(entity_type: String, entity_id: String) -> Self {
+    // For use in tests only
+    #[cfg(debug_assertions)]
+    pub fn data(entity_type: impl Into<String>, entity_id: impl Into<String>) -> Self {
         Self {
-            entity_type: EntityType::new(entity_type),
-            entity_id: entity_id.into(),
+            entity_type: EntityType::new(entity_type.into()),
+            entity_id: entity_id.into().into(),
+            causality_region: CausalityRegion::ONCHAIN,
+        }
+    }
+
+    pub fn from(id: &String, load_related_request: &LoadRelatedRequest) -> Self {
+        let clone = load_related_request.clone();
+        Self {
+            entity_id: id.clone().into(),
+            entity_type: clone.entity_type,
+            causality_region: clone.causality_region,
         }
     }
 }
@@ -148,6 +228,7 @@ pub enum EntityFilter {
     NotEndsWithNoCase(Attribute, Value),
     ChangeBlockGte(BlockNumber),
     Child(Child),
+    Fulltext(Attribute, Value),
 }
 
 // A somewhat concise string representation of a filter
@@ -162,21 +243,17 @@ impl fmt::Display for EntityFilter {
             Or(fs) => {
                 write!(f, "{}", fs.iter().map(|f| f.to_string()).join(" or "))
             }
-            Equal(a, v) => write!(f, "{a} = {v}"),
+            Equal(a, v) | Fulltext(a, v) => write!(f, "{a} = {v}"),
             Not(a, v) => write!(f, "{a} != {v}"),
             GreaterThan(a, v) => write!(f, "{a} > {v}"),
             LessThan(a, v) => write!(f, "{a} < {v}"),
             GreaterOrEqual(a, v) => write!(f, "{a} >= {v}"),
             LessOrEqual(a, v) => write!(f, "{a} <= {v}"),
-            In(a, vs) => write!(
-                f,
-                "{a} in ({})",
-                vs.into_iter().map(|v| v.to_string()).join(",")
-            ),
+            In(a, vs) => write!(f, "{a} in ({})", vs.iter().map(|v| v.to_string()).join(",")),
             NotIn(a, vs) => write!(
                 f,
                 "{a} not in ({})",
-                vs.into_iter().map(|v| v.to_string()).join(",")
+                vs.iter().map(|v| v.to_string()).join(",")
             ),
             Contains(a, v) => write!(f, "{a} ~ *{v}*"),
             ContainsNoCase(a, v) => write!(f, "{a} ~ *{v}*i"),
@@ -194,9 +271,7 @@ impl fmt::Display for EntityFilter {
             Child(child /* a, et, cf, _ */) => write!(
                 f,
                 "join on {} with {}({})",
-                child.attr,
-                child.entity_type,
-                child.filter.to_string()
+                child.attr, child.entity_type, child.filter
             ),
         }
     }
@@ -244,6 +319,24 @@ impl EntityFilter {
     }
 }
 
+/// Holds the information needed to query a store.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EntityOrderByChildInfo {
+    /// The attribute of the child entity that is used to order the results.
+    pub sort_by_attribute: Attribute,
+    /// The attribute that is used to join to the parent and child entity.
+    pub join_attribute: Attribute,
+    /// If true, the child entity is derived from the parent entity.
+    pub derived: bool,
+}
+
+/// Holds the information needed to order the results of a query based on nested entities.
+#[derive(Clone, Debug, PartialEq)]
+pub enum EntityOrderByChild {
+    Object(EntityOrderByChildInfo, EntityType),
+    Interface(EntityOrderByChildInfo, Vec<EntityType>),
+}
+
 /// The order in which entities should be restored from a store.
 #[derive(Clone, Debug, PartialEq)]
 pub enum EntityOrder {
@@ -251,6 +344,10 @@ pub enum EntityOrder {
     Ascending(String, ValueType),
     /// Order descending by the given attribute. Use `id` as a tie-breaker
     Descending(String, ValueType),
+    /// Order ascending by the given attribute of a child entity. Use `id` as a tie-breaker
+    ChildAscending(EntityOrderByChild),
+    /// Order descending by the given attribute of a child entity. Use `id` as a tie-breaker
+    ChildDescending(EntityOrderByChild),
     /// Order by the `id` of the entities
     Default,
     /// Do not order at all. This speeds up queries where we know that
@@ -433,6 +530,8 @@ pub struct EntityQuery {
 
     pub query_id: Option<String>,
 
+    pub trace: bool,
+
     _force_use_of_new: (),
 }
 
@@ -451,6 +550,7 @@ impl EntityQuery {
             range: EntityRange::first(100),
             logger: None,
             query_id: None,
+            trace: false,
             _force_use_of_new: (),
         }
     }
@@ -492,15 +592,15 @@ impl EntityQuery {
                     if let EntityLink::Direct(attribute, _) = &window.link {
                         let filter = match attribute {
                             WindowAttribute::Scalar(name) => {
-                                EntityFilter::Equal(name.to_owned(), id.into())
+                                EntityFilter::Equal(name.clone(), id.into())
                             }
                             WindowAttribute::List(name) => {
-                                EntityFilter::Contains(name.to_owned(), Value::from(vec![id]))
+                                EntityFilter::Contains(name.clone(), Value::from(vec![id]))
                             }
                         };
                         self.filter = Some(filter.and_maybe(self.filter));
                         self.collection = EntityCollection::All(vec![(
-                            window.child_type.to_owned(),
+                            window.child_type.clone(),
                             window.column_names.clone(),
                         )]);
                     }
@@ -799,7 +899,8 @@ pub struct StoredDynamicDataSource {
     pub param: Option<Bytes>,
     pub context: Option<serde_json::Value>,
     pub creation_block: Option<BlockNumber>,
-    pub is_offchain: bool,
+    pub done_at: Option<i32>,
+    pub causality_region: CausalityRegion,
 }
 
 /// An internal identifer for the specific instance of a deployment. The
@@ -1065,10 +1166,14 @@ impl ReadStore for EmptyStore {
         Ok(None)
     }
 
-    fn get_many(
+    fn get_many(&self, _: BTreeSet<EntityKey>) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        Ok(BTreeMap::new())
+    }
+
+    fn get_derived(
         &self,
-        _ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+        _query: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         Ok(BTreeMap::new())
     }
 
@@ -1086,25 +1191,211 @@ pub struct VersionStats {
     pub tablename: String,
     /// The ratio `entities / versions`
     pub ratio: f64,
+    /// The last block to which this table was pruned
+    pub last_pruned_block: Option<BlockNumber>,
+}
+
+/// What phase of pruning we are working on
+pub enum PrunePhase {
+    /// Handling final entities
+    CopyFinal,
+    /// Handling nonfinal entities
+    CopyNonfinal,
+    /// Delete unneeded entity versions
+    Delete,
+}
+
+impl PrunePhase {
+    pub fn strategy(&self) -> PruningStrategy {
+        match self {
+            PrunePhase::CopyFinal | PrunePhase::CopyNonfinal => PruningStrategy::Rebuild,
+            PrunePhase::Delete => PruningStrategy::Delete,
+        }
+    }
 }
 
 /// Callbacks for `SubgraphStore.prune` so that callers can report progress
 /// of the pruning procedure to users
 #[allow(unused_variables)]
 pub trait PruneReporter: Send + 'static {
+    /// A pruning run has started. It will use the given `strategy` and
+    /// remove `history_frac` part of the blocks of the deployment, which
+    /// amounts to `history_blocks` many blocks.
+    ///
+    /// Before pruning, the subgraph has data for blocks from
+    /// `earliest_block` to `latest_block`
+    fn start(&mut self, req: &PruneRequest) {}
+
     fn start_analyze(&mut self) {}
     fn start_analyze_table(&mut self, table: &str) {}
     fn finish_analyze_table(&mut self, table: &str) {}
-    fn finish_analyze(&mut self, stats: &[VersionStats]) {}
 
-    fn copy_final_start(&mut self, earliest_block: BlockNumber, final_block: BlockNumber) {}
-    fn copy_final_batch(&mut self, table: &str, rows: usize, total_rows: usize, finished: bool) {}
-    fn copy_final_finish(&mut self) {}
+    /// Analyzing tables has finished. `stats` are the stats for all tables
+    /// in the deployment, `analyzed ` are the names of the tables that were
+    /// actually analyzed
+    fn finish_analyze(&mut self, stats: &[VersionStats], analyzed: &[&str]) {}
 
+    fn start_table(&mut self, table: &str) {}
+    fn prune_batch(&mut self, table: &str, rows: usize, phase: PrunePhase, finished: bool) {}
     fn start_switch(&mut self) {}
-    fn copy_nonfinal_start(&mut self, table: &str) {}
-    fn copy_nonfinal_finish(&mut self, table: &str, rows: usize) {}
     fn finish_switch(&mut self) {}
+    fn finish_table(&mut self, table: &str) {}
 
-    fn finish_prune(&mut self) {}
+    fn finish(&mut self) {}
+}
+
+/// Select how pruning should be done
+#[derive(Clone, Copy, Debug, Display, PartialEq)]
+pub enum PruningStrategy {
+    /// Rebuild by copying the data we want to keep to new tables and swap
+    /// them out for the existing tables
+    Rebuild,
+    /// Delete unneeded data from the existing tables
+    Delete,
+}
+
+#[derive(Copy, Clone)]
+/// A request to prune a deployment. This struct encapsulates decision
+/// making around the best strategy for pruning (deleting historical
+/// entities or copying current ones) It needs to be filled with accurate
+/// information about the deployment that should be pruned.
+pub struct PruneRequest {
+    /// How many blocks of history to keep
+    pub history_blocks: BlockNumber,
+    /// The reorg threshold for the chain the deployment is on
+    pub reorg_threshold: BlockNumber,
+    /// The earliest block pruning should preserve
+    pub earliest_block: BlockNumber,
+    /// The last block that contains final entities not subject to a reorg
+    pub final_block: BlockNumber,
+    /// The latest block, i.e., the subgraph head
+    pub latest_block: BlockNumber,
+    /// Use the rebuild strategy when removing more than this fraction of
+    /// history. Initialized from `ENV_VARS.store.rebuild_threshold`, but
+    /// can be modified after construction
+    pub rebuild_threshold: f64,
+    /// Use the delete strategy when removing more than this fraction of
+    /// history but less than `rebuild_threshold`. Initialized from
+    /// `ENV_VARS.store.delete_threshold`, but can be modified after
+    /// construction
+    pub delete_threshold: f64,
+}
+
+impl PruneRequest {
+    /// Create a `PruneRequest` for a deployment that currently contains
+    /// entities for blocks from `first_block` to `latest_block` that should
+    /// retain only `history_blocks` blocks of history and is subject to a
+    /// reorg threshold of `reorg_threshold`.
+    pub fn new(
+        deployment: &DeploymentLocator,
+        history_blocks: BlockNumber,
+        reorg_threshold: BlockNumber,
+        first_block: BlockNumber,
+        latest_block: BlockNumber,
+    ) -> Result<Self, StoreError> {
+        let rebuild_threshold = ENV_VARS.store.rebuild_threshold;
+        let delete_threshold = ENV_VARS.store.delete_threshold;
+        if rebuild_threshold < 0.0 || rebuild_threshold > 1.0 {
+            return Err(constraint_violation!(
+                "the copy threshold must be between 0 and 1 but is {rebuild_threshold}"
+            ));
+        }
+        if delete_threshold < 0.0 || delete_threshold > 1.0 {
+            return Err(constraint_violation!(
+                "the delete threshold must be between 0 and 1 but is {delete_threshold}"
+            ));
+        }
+        if history_blocks <= reorg_threshold {
+            return Err(constraint_violation!(
+                "the deployment {} needs to keep at least {} blocks \
+                   of history and can't be pruned to only {} blocks of history",
+                deployment,
+                reorg_threshold + 1,
+                history_blocks
+            ));
+        }
+        if first_block >= latest_block {
+            return Err(constraint_violation!(
+                "the earliest block {} must be before the latest block {}",
+                first_block,
+                latest_block
+            ));
+        }
+
+        let earliest_block = latest_block - history_blocks;
+        let final_block = latest_block - reorg_threshold;
+
+        Ok(Self {
+            history_blocks,
+            reorg_threshold,
+            earliest_block,
+            final_block,
+            latest_block,
+            rebuild_threshold,
+            delete_threshold,
+        })
+    }
+
+    /// Determine what strategy to use for pruning
+    ///
+    /// We are pruning `history_pct` of the blocks from a table that has a
+    /// ratio of `version_ratio` entities to versions. If we are removing
+    /// more than `rebuild_threshold` percent of the versions, we prune by
+    /// rebuilding, and if we are removing more than `delete_threshold`
+    /// percent of the versions, we prune by deleting. If we would remove
+    /// less than `delete_threshold` percent of the versions, we don't
+    /// prune.
+    pub fn strategy(&self, stats: &VersionStats) -> Option<PruningStrategy> {
+        // If the deployment doesn't have enough history to cover the reorg
+        // threshold, do not prune
+        if self.earliest_block >= self.final_block {
+            return None;
+        }
+
+        // Estimate how much data we will throw away; we assume that
+        // entity versions are distributed evenly across all blocks so
+        // that `history_pct` will tell us how much of that data pruning
+        // will remove.
+        let removal_ratio = self.history_pct(stats) * (1.0 - stats.ratio);
+        if removal_ratio >= self.rebuild_threshold {
+            Some(PruningStrategy::Rebuild)
+        } else if removal_ratio >= self.delete_threshold {
+            Some(PruningStrategy::Delete)
+        } else {
+            None
+        }
+    }
+
+    /// Return an estimate of the fraction of the entities that are
+    /// historical in the table whose `stats` we are given
+    fn history_pct(&self, stats: &VersionStats) -> f64 {
+        let total_blocks = self.latest_block - stats.last_pruned_block.unwrap_or(0);
+        if total_blocks <= 0 || total_blocks < self.history_blocks {
+            // Something has gone very wrong; this could happen if the
+            // subgraph is ever rewound to before the last_pruned_block or
+            // if this is called when the subgraph has fewer blocks than
+            // history_blocks. In both cases, which should be transient,
+            // pretend that we would not delete any history
+            0.0
+        } else {
+            1.0 - self.history_blocks as f64 / total_blocks as f64
+        }
+    }
+}
+
+/// Represents an item retrieved from an
+/// [`EthereumCallCache`](super::EthereumCallCache) implementor.
+pub struct CachedEthereumCall {
+    /// The BLAKE3 hash that uniquely represents this cache item. The way this
+    /// hash is constructed is an implementation detail.
+    pub blake3_id: Vec<u8>,
+
+    /// Block details related to this Ethereum call.
+    pub block_ptr: BlockPtr,
+
+    /// The address to the called contract.
+    pub contract_address: ethabi::Address,
+
+    /// The encoded return value of this call.
+    pub return_value: Vec<u8>,
 }

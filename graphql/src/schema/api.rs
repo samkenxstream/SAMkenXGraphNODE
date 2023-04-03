@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use graphql_parser::Pos;
+use graphql_parser::{schema::TypeDefinition, Pos};
 use inflector::Inflector;
 use lazy_static::lazy_static;
 
@@ -157,16 +157,7 @@ fn add_order_by_type(
                 description: None,
                 name: type_name,
                 directives: vec![],
-                values: fields
-                    .iter()
-                    .map(|field| &field.name)
-                    .map(|name| EnumValue {
-                        position: Pos::default(),
-                        description: None,
-                        name: name.to_owned(),
-                        directives: vec![],
-                    })
-                    .collect(),
+                values: field_enum_values(schema, fields)?,
             });
             let def = Definition::TypeDefinition(typedef);
             schema.definitions.push(def);
@@ -174,6 +165,80 @@ fn add_order_by_type(
         Some(_) => return Err(APISchemaError::TypeExists(type_name)),
     }
     Ok(())
+}
+
+/// Generates enum values for the given set of fields.
+fn field_enum_values(
+    schema: &Document,
+    fields: &[Field],
+) -> Result<Vec<EnumValue>, APISchemaError> {
+    let mut enum_values = vec![];
+    for field in fields {
+        enum_values.push(EnumValue {
+            position: Pos::default(),
+            description: None,
+            name: field.name.clone(),
+            directives: vec![],
+        });
+        enum_values.extend(field_enum_values_from_child_entity(schema, field)?);
+    }
+    Ok(enum_values)
+}
+
+fn enum_value_from_child_entity_field(
+    schema: &Document,
+    parent_field_name: &str,
+    field: &Field,
+) -> Option<EnumValue> {
+    if ast::is_list_or_non_null_list_field(field) || ast::is_entity_type(schema, &field.field_type)
+    {
+        // Sorting on lists or entities is not supported.
+        None
+    } else {
+        Some(EnumValue {
+            position: Pos::default(),
+            description: None,
+            name: format!("{}__{}", parent_field_name, field.name),
+            directives: vec![],
+        })
+    }
+}
+
+fn field_enum_values_from_child_entity(
+    schema: &Document,
+    field: &Field,
+) -> Result<Vec<EnumValue>, APISchemaError> {
+    fn resolve_supported_type_name(field_type: &Type) -> Option<&String> {
+        match field_type {
+            Type::NamedType(name) => Some(name),
+            Type::ListType(_) => None,
+            Type::NonNullType(of_type) => resolve_supported_type_name(of_type),
+        }
+    }
+
+    let type_name = match ENV_VARS.graphql.disable_child_sorting {
+        true => None,
+        false => resolve_supported_type_name(&field.field_type),
+    };
+
+    Ok(match type_name {
+        Some(name) => {
+            let named_type = schema
+                .get_named_type(name)
+                .ok_or_else(|| APISchemaError::TypeNotFound(name.clone()))?;
+            match named_type {
+                TypeDefinition::Object(ObjectType { fields, .. })
+                | TypeDefinition::Interface(InterfaceType { fields, .. }) => fields
+                    .iter()
+                    .filter_map(|f| {
+                        enum_value_from_child_entity_field(schema, field.name.as_str(), f)
+                    })
+                    .collect(),
+                _ => vec![],
+            }
+        }
+        None => vec![],
+    })
 }
 
 /// Adds a `<type_name>_filter` enum type for the given fields to the schema.
@@ -187,6 +252,26 @@ fn add_filter_type(
         None => {
             let mut generated_filter_fields = field_input_values(schema, fields)?;
             generated_filter_fields.push(block_changed_filter_argument());
+
+            if !ENV_VARS.graphql.disable_bool_filters {
+                generated_filter_fields.push(InputValue {
+                    position: Pos::default(),
+                    description: None,
+                    name: "and".to_string(),
+                    value_type: Type::ListType(Box::new(Type::NamedType(filter_type_name.clone()))),
+                    default_value: None,
+                    directives: vec![],
+                });
+
+                generated_filter_fields.push(InputValue {
+                    position: Pos::default(),
+                    description: None,
+                    name: "or".to_string(),
+                    value_type: Type::ListType(Box::new(Type::NamedType(filter_type_name.clone()))),
+                    default_value: None,
+                    directives: vec![],
+                });
+            }
 
             let typedef = TypeDefinition::InputObject(InputObjectType {
                 position: Pos::default(),
@@ -252,7 +337,7 @@ fn field_filter_input_values(
             })
         }
         Type::ListType(ref t) => {
-            Ok(field_list_filter_input_values(schema, field, t).unwrap_or(vec![]))
+            Ok(field_list_filter_input_values(schema, field, t).unwrap_or_default())
         }
         Type::NonNullType(ref t) => field_filter_input_values(schema, field, t),
     }
@@ -267,7 +352,18 @@ fn field_scalar_filter_input_values(
     match field_type.name.as_ref() {
         "BigInt" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "Boolean" => vec!["", "not", "in", "not_in"],
-        "Bytes" => vec!["", "not", "in", "not_in", "contains", "not_contains"],
+        "Bytes" => vec![
+            "",
+            "not",
+            "gt",
+            "lt",
+            "gte",
+            "lte",
+            "in",
+            "not_in",
+            "contains",
+            "not_contains",
+        ],
         "BigDecimal" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "ID" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
         "Int" => vec!["", "not", "gt", "lt", "gte", "lte", "in", "not_in"],
@@ -297,7 +393,7 @@ fn field_scalar_filter_input_values(
     }
     .into_iter()
     .map(|filter_type| {
-        let field_type = Type::NamedType(field_type.name.to_owned());
+        let field_type = Type::NamedType(field_type.name.clone());
         let value_type = match filter_type {
             "in" | "not_in" => Type::ListType(Box::new(Type::NonNullType(Box::new(field_type)))),
             _ => field_type,
@@ -329,7 +425,7 @@ fn field_enum_filter_input_values(
     vec!["", "not", "in", "not_in"]
         .into_iter()
         .map(|filter_type| {
-            let field_type = Type::NamedType(field_type.name.to_owned());
+            let field_type = Type::NamedType(field_type.name.clone());
             let value_type = match filter_type {
                 "in" | "not_in" => {
                     Type::ListType(Box::new(Type::NonNullType(Box::new(field_type))))
@@ -348,7 +444,7 @@ fn field_list_filter_input_values(
     field_type: &Type,
 ) -> Option<Vec<InputValue>> {
     // Only add a filter field if the type of the field exists in the schema
-    ast::get_type_definition_from_type(schema, field_type).and_then(|typedef| {
+    ast::get_type_definition_from_type(schema, field_type).map(|typedef| {
         // Decide what type of values can be passed to the filter. In the case
         // one-to-many or many-to-many object or interface fields that are not
         // derived, we allow ID strings to be passed on.
@@ -362,8 +458,8 @@ fn field_list_filter_input_values(
                     (Some(Type::NamedType("String".into())), Some(name.clone()))
                 }
             }
-            TypeDefinition::Scalar(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
-            TypeDefinition::Enum(ref t) => (Some(Type::NamedType(t.name.to_owned())), None),
+            TypeDefinition::Scalar(ref t) => (Some(Type::NamedType(t.name.clone())), None),
+            TypeDefinition::Enum(ref t) => (Some(Type::NamedType(t.name.clone())), None),
             TypeDefinition::InputObject(_) | TypeDefinition::Union(_) => (None, None),
         };
 
@@ -396,7 +492,7 @@ fn field_list_filter_input_values(
             extend_with_child_filter_input_value(field, &parent, &mut input_values);
         }
 
-        Some(input_values)
+        input_values
     })
 }
 
@@ -496,6 +592,11 @@ fn query_field_for_fulltext(fulltext: &Directive) -> Option<Field> {
         },
         // block: BlockHeight
         block_argument(),
+        input_value(
+            "where",
+            "",
+            Type::NamedType(format!("{}_filter", entity_name)),
+        ),
     ];
 
     arguments.push(subgraph_error_argument());
@@ -662,27 +763,27 @@ fn collection_arguments_for_named_type(type_name: &str) -> Vec<InputValue> {
     // `first` and `skip` should be non-nullable, but the Apollo graphql client
     // exhibts non-conforming behaviour by erroing if no value is provided for a
     // non-nullable field, regardless of the presence of a default.
-    let mut skip = input_value(&"skip".to_string(), "", Type::NamedType("Int".to_string()));
+    let mut skip = input_value("skip", "", Type::NamedType("Int".to_string()));
     skip.default_value = Some(Value::Int(0.into()));
 
-    let mut first = input_value(&"first".to_string(), "", Type::NamedType("Int".to_string()));
+    let mut first = input_value("first", "", Type::NamedType("Int".to_string()));
     first.default_value = Some(Value::Int(100.into()));
 
     let args = vec![
         skip,
         first,
         input_value(
-            &"orderBy".to_string(),
+            "orderBy",
             "",
             Type::NamedType(format!("{}_orderBy", type_name)),
         ),
         input_value(
-            &"orderDirection".to_string(),
+            "orderDirection",
             "",
             Type::NamedType("OrderDirection".to_string()),
         ),
         input_value(
-            &"where".to_string(),
+            "where",
             "",
             Type::NamedType(format!("{}_filter", type_name)),
         ),
@@ -853,6 +954,180 @@ mod tests {
     }
 
     #[test]
+    fn api_schema_contains_field_order_by_enum_for_child_entity() {
+        let input_schema = parse_schema(
+            r#"
+              enum FurType {
+                  NONE
+                  FLUFFY
+                  BRISTLY
+              }
+
+              type Pet {
+                  id: ID!
+                  name: String!
+                  mostHatedBy: [User!]!
+                  mostLovedBy: [User!]!
+              }
+
+              interface Recipe {
+                id: ID!
+                name: String!
+                author: User!
+                lovedBy: [User!]!
+                ingredients: [String!]!
+              }
+
+              type FoodRecipe implements Recipe {
+                id: ID!
+                name: String!
+                author: User!
+                ingredients: [String!]!
+              }
+
+              type DrinkRecipe implements Recipe {
+                id: ID!
+                name: String!
+                author: User!
+                ingredients: [String!]!
+              }
+
+              interface Meal {
+                id: ID!
+                name: String!
+                mostHatedBy: [User!]!
+                mostLovedBy: [User!]!
+              }
+
+              type Pizza implements Meal {
+                id: ID!
+                name: String!
+                toppings: [String!]!
+                mostHatedBy: [User!]!
+                mostLovedBy: [User!]!
+              }
+
+              type Burger implements Meal {
+                id: ID!
+                name: String!
+                bun: String!
+                mostHatedBy: [User!]!
+                mostLovedBy: [User!]!
+              }
+
+              type User {
+                  id: ID!
+                  name: String!
+                  favoritePetNames: [String!]
+                  pets: [Pet!]!
+                  favoriteFurType: FurType!
+                  favoritePet: Pet!
+                  leastFavoritePet: Pet @derivedFrom(field: "mostHatedBy")
+                  mostFavoritePets: [Pet!] @derivedFrom(field: "mostLovedBy")
+                  favoriteMeal: Meal!
+                  leastFavoriteMeal: Meal @derivedFrom(field: "mostHatedBy")
+                  mostFavoriteMeals: [Meal!] @derivedFrom(field: "mostLovedBy")
+                  recipes: [Recipe!]! @derivedFrom(field: "author")
+              }
+            "#,
+        )
+        .expect("Failed to parse input schema");
+        let schema = api_schema(&input_schema).expect("Failed to derived API schema");
+
+        let user_order_by = schema
+            .get_named_type("User_orderBy")
+            .expect("User_orderBy type is missing in derived API schema");
+
+        let enum_type = match user_order_by {
+            TypeDefinition::Enum(t) => Some(t),
+            _ => None,
+        }
+        .expect("User_orderBy type is not an enum");
+
+        let values: Vec<&str> = enum_type
+            .values
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+
+        assert_eq!(
+            values,
+            [
+                "id",
+                "name",
+                "favoritePetNames",
+                "pets",
+                "favoriteFurType",
+                "favoritePet",
+                "favoritePet__id",
+                "favoritePet__name",
+                "leastFavoritePet",
+                "leastFavoritePet__id",
+                "leastFavoritePet__name",
+                "mostFavoritePets",
+                "favoriteMeal",
+                "favoriteMeal__id",
+                "favoriteMeal__name",
+                "leastFavoriteMeal",
+                "leastFavoriteMeal__id",
+                "leastFavoriteMeal__name",
+                "mostFavoriteMeals",
+                "recipes",
+            ]
+        );
+
+        let meal_order_by = schema
+            .get_named_type("Meal_orderBy")
+            .expect("Meal_orderBy type is missing in derived API schema");
+
+        let enum_type = match meal_order_by {
+            TypeDefinition::Enum(t) => Some(t),
+            _ => None,
+        }
+        .expect("Meal_orderBy type is not an enum");
+
+        let values: Vec<&str> = enum_type
+            .values
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+
+        assert_eq!(values, ["id", "name", "mostHatedBy", "mostLovedBy",]);
+
+        let recipe_order_by = schema
+            .get_named_type("Recipe_orderBy")
+            .expect("Recipe_orderBy type is missing in derived API schema");
+
+        let enum_type = match recipe_order_by {
+            TypeDefinition::Enum(t) => Some(t),
+            _ => None,
+        }
+        .expect("Recipe_orderBy type is not an enum");
+
+        let values: Vec<&str> = enum_type
+            .values
+            .iter()
+            .map(|value| value.name.as_str())
+            .collect();
+
+        assert_eq!(
+            values,
+            [
+                "id",
+                "name",
+                "author",
+                "author__id",
+                "author__name",
+                "author__favoriteFurType",
+                "author__favoritePet",
+                "author__leastFavoritePet",
+                "lovedBy",
+                "ingredients"
+            ]
+        );
+    }
+
+    #[test]
     fn api_schema_contains_object_type_filter_enum() {
         let input_schema = parse_schema(
             r#"
@@ -898,7 +1173,7 @@ mod tests {
             user_filter_type
                 .fields
                 .iter()
-                .map(|field| field.name.to_owned())
+                .map(|field| field.name.clone())
                 .collect::<Vec<String>>(),
             [
                 "id",
@@ -969,7 +1244,9 @@ mod tests {
                 "favoritePet_",
                 "leastFavoritePet_",
                 "mostFavoritePets_",
-                "_change_block"
+                "_change_block",
+                "and",
+                "or"
             ]
             .iter()
             .map(ToString::to_string)
@@ -1001,7 +1278,7 @@ mod tests {
             pet_filter_type
                 .fields
                 .iter()
-                .map(|field| field.name.to_owned())
+                .map(|field| field.name.clone())
                 .collect::<Vec<String>>(),
             [
                 "id",
@@ -1046,7 +1323,9 @@ mod tests {
                 "mostLovedBy_not_contains",
                 "mostLovedBy_not_contains_nocase",
                 "mostLovedBy_",
-                "_change_block"
+                "_change_block",
+                "and",
+                "or"
             ]
             .iter()
             .map(ToString::to_string)
@@ -1117,7 +1396,7 @@ mod tests {
             user_filter_type
                 .fields
                 .iter()
-                .map(|field| field.name.to_owned())
+                .map(|field| field.name.clone())
                 .collect::<Vec<String>>(),
             [
                 "id",
@@ -1170,7 +1449,9 @@ mod tests {
                 "favoritePet_not_ends_with",
                 "favoritePet_not_ends_with_nocase",
                 "favoritePet_",
-                "_change_block"
+                "_change_block",
+                "and",
+                "or"
             ]
             .iter()
             .map(ToString::to_string)
@@ -1209,7 +1490,7 @@ mod tests {
             .expect("Query type is missing in derived API schema");
 
         let user_singular_field = match query_type {
-            TypeDefinition::Object(t) => ast::get_field(t, &"user".to_string()),
+            TypeDefinition::Object(t) => ast::get_field(t, "user"),
             _ => None,
         }
         .expect("\"user\" field is missing on Query type");
@@ -1223,7 +1504,7 @@ mod tests {
             user_singular_field
                 .arguments
                 .iter()
-                .map(|input_value| input_value.name.to_owned())
+                .map(|input_value| input_value.name.clone())
                 .collect::<Vec<String>>(),
             vec![
                 "id".to_string(),
@@ -1233,7 +1514,7 @@ mod tests {
         );
 
         let user_plural_field = match query_type {
-            TypeDefinition::Object(t) => ast::get_field(t, &"users".to_string()),
+            TypeDefinition::Object(t) => ast::get_field(t, "users"),
             _ => None,
         }
         .expect("\"users\" field is missing on Query type");
@@ -1249,7 +1530,7 @@ mod tests {
             user_plural_field
                 .arguments
                 .iter()
-                .map(|input_value| input_value.name.to_owned())
+                .map(|input_value| input_value.name.clone())
                 .collect::<Vec<String>>(),
             [
                 "skip",
@@ -1266,7 +1547,7 @@ mod tests {
         );
 
         let user_profile_singular_field = match query_type {
-            TypeDefinition::Object(t) => ast::get_field(t, &"userProfile".to_string()),
+            TypeDefinition::Object(t) => ast::get_field(t, "userProfile"),
             _ => None,
         }
         .expect("\"userProfile\" field is missing on Query type");
@@ -1277,7 +1558,7 @@ mod tests {
         );
 
         let user_profile_plural_field = match query_type {
-            TypeDefinition::Object(t) => ast::get_field(t, &"userProfiles".to_string()),
+            TypeDefinition::Object(t) => ast::get_field(t, "userProfiles"),
             _ => None,
         }
         .expect("\"userProfiles\" field is missing on Query type");
@@ -1306,7 +1587,7 @@ mod tests {
             .expect("Query type is missing in derived API schema");
 
         let singular_field = match query_type {
-            TypeDefinition::Object(ref t) => ast::get_field(t, &"node".to_string()),
+            TypeDefinition::Object(ref t) => ast::get_field(t, "node"),
             _ => None,
         }
         .expect("\"node\" field is missing on Query type");
@@ -1320,7 +1601,7 @@ mod tests {
             singular_field
                 .arguments
                 .iter()
-                .map(|input_value| input_value.name.to_owned())
+                .map(|input_value| input_value.name.clone())
                 .collect::<Vec<String>>(),
             vec![
                 "id".to_string(),
@@ -1330,7 +1611,7 @@ mod tests {
         );
 
         let plural_field = match query_type {
-            TypeDefinition::Object(ref t) => ast::get_field(t, &"nodes".to_string()),
+            TypeDefinition::Object(ref t) => ast::get_field(t, "nodes"),
             _ => None,
         }
         .expect("\"nodes\" field is missing on Query type");
@@ -1346,7 +1627,7 @@ mod tests {
             plural_field
                 .arguments
                 .iter()
-                .map(|input_value| input_value.name.to_owned())
+                .map(|input_value| input_value.name.clone())
                 .collect::<Vec<String>>(),
             [
                 "skip",

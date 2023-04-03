@@ -291,7 +291,7 @@ where
                             return send_error_string(
                                 &msg_sink,
                                 id,
-                                format!("Invalid variables provided (must be an object)"),
+                                "Invalid variables provided (must be an object)".to_string(),
                             );
                         }
                     };
@@ -301,7 +301,7 @@ where
                     let subscription = Subscription {
                         // Subscriptions currently do not benefit from the generational cache
                         // anyways, so don't bother passing a network.
-                        query: Query::new(query, variables),
+                        query: Query::new(query, variables, false),
                     };
 
                     debug!(logger, "Start operation";

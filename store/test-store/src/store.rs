@@ -3,6 +3,7 @@ use graph::data::graphql::effort::LoadManager;
 use graph::data::query::QueryResults;
 use graph::data::query::QueryTarget;
 use graph::data::subgraph::schema::{DeploymentCreate, SubgraphError};
+use graph::data_source::CausalityRegion;
 use graph::log;
 use graph::prelude::{QueryStoreManager as _, SubgraphStore as _, *};
 use graph::semver::Version;
@@ -16,7 +17,6 @@ use graph_graphql::prelude::{
     execute_query, Query as PreparedQuery, QueryExecutionOptions, StoreResolver,
 };
 use graph_graphql::test_support::GraphQLMetrics;
-use graph_mock::MockMetricsRegistry;
 use graph_node::config::{Config, Opt};
 use graph_node::store_builder::StoreBuilder;
 use graph_store_postgres::layout_for_tests::FAKE_NETWORK_SHARED;
@@ -49,10 +49,9 @@ lazy_static! {
     static ref SEQ_LOCK: Mutex<()> = Mutex::new(());
     pub static ref STORE_RUNTIME: Runtime =
         Builder::new_multi_thread().enable_all().build().unwrap();
-    pub static ref METRICS_REGISTRY: Arc<MockMetricsRegistry> =
-        Arc::new(MockMetricsRegistry::new());
+    pub static ref METRICS_REGISTRY: Arc<MetricsRegistry> = Arc::new(MetricsRegistry::mock());
     pub static ref LOAD_MANAGER: Arc<LoadManager> = Arc::new(LoadManager::new(
-        &*LOGGER,
+        &LOGGER,
         Vec::new(),
         METRICS_REGISTRY.clone(),
     ));
@@ -63,7 +62,7 @@ lazy_static! {
     static ref CONFIG: Config = STORE_POOL_CONFIG.2.clone();
     pub static ref SUBSCRIPTION_MANAGER: Arc<SubscriptionManager> = STORE_POOL_CONFIG.3.clone();
     pub static ref NODE_ID: NodeId = NodeId::new("test").unwrap();
-    static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
+    pub static ref SUBGRAPH_STORE: Arc<DieselSubgraphStore> = STORE.subgraph_store();
     static ref BLOCK_STORE: Arc<DieselBlockStore> = STORE.block_store();
     pub static ref GENESIS_PTR: BlockPtr = (
         H256::from(hex!(
@@ -122,7 +121,7 @@ where
 /// Run a test with a connection into the primary database, not a full store
 pub fn run_test_with_conn<F>(test: F)
 where
-    F: FnOnce(&PgConnection) -> (),
+    F: FnOnce(&PgConnection),
 {
     // Lock regardless of poisoning. This also forces sequential test execution.
     let _lock = match SEQ_LOCK.lock() {
@@ -189,7 +188,7 @@ pub async fn create_subgraph(
         .cheap_clone()
         .writable(LOGGER.clone(), deployment.id)
         .await?
-        .start_subgraph_deployment(&*LOGGER)
+        .start_subgraph_deployment(&LOGGER)
         .await?;
     Ok(deployment)
 }
@@ -217,7 +216,7 @@ pub async fn transact_errors(
     block_ptr_to: BlockPtr,
     errs: Vec<SubgraphError>,
 ) -> Result<(), StoreError> {
-    let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::mock());
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
@@ -226,7 +225,7 @@ pub async fn transact_errors(
     );
     store
         .subgraph_store()
-        .writable(LOGGER.clone(), deployment.id.clone())
+        .writable(LOGGER.clone(), deployment.id)
         .await?
         .transact_block_operations(
             block_ptr_to,
@@ -295,7 +294,7 @@ pub async fn transact_entities_and_dynamic_data_sources(
         .as_modifications()
         .expect("failed to convert to modifications")
         .modifications;
-    let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::mock());
     let stopwatch_metrics = StopwatchMetrics::new(
         Logger::root(slog::Discard, o!()),
         deployment.hash.clone(),
@@ -353,14 +352,15 @@ pub async fn insert_entities(
         .into_iter()
         .map(|(entity_type, data)| EntityOperation::Set {
             key: EntityKey {
-                entity_type: entity_type.to_owned(),
+                entity_type,
                 entity_id: data.get("id").unwrap().clone().as_string().unwrap().into(),
+                causality_region: CausalityRegion::ONCHAIN,
             },
             data,
         });
 
     transact_entity_operations(
-        &*SUBGRAPH_STORE,
+        &SUBGRAPH_STORE,
         deployment,
         GENESIS_PTR.clone(),
         insert_ops.collect::<Vec<_>>(),
@@ -446,6 +446,7 @@ async fn execute_subgraph_query_internal(
     )
     .unwrap();
     let network = Some(status[0].chains[0].network.clone());
+    let trace = query.trace;
     let query = return_err!(PreparedQuery::new(
         &logger,
         schema,
@@ -459,10 +460,7 @@ async fn execute_subgraph_query_internal(
     let deployment = query.schema.id().clone();
     let store = STORE
         .clone()
-        .query_store(
-            QueryTarget::Deployment(deployment.into(), version.clone()),
-            false,
-        )
+        .query_store(QueryTarget::Deployment(deployment, version.clone()), false)
         .await
         .unwrap();
     let state = store.deployment_state().await.unwrap();
@@ -492,6 +490,7 @@ async fn execute_subgraph_query_internal(
                     load_manager: LOAD_MANAGER.clone(),
                     max_first: std::u32::MAX,
                     max_skip: std::u32::MAX,
+                    trace,
                 },
             )
             .await,
@@ -503,7 +502,7 @@ async fn execute_subgraph_query_internal(
 pub async fn deployment_state(store: &Store, subgraph_id: &DeploymentHash) -> DeploymentState {
     store
         .query_store(
-            QueryTarget::Deployment(subgraph_id.to_owned(), Default::default()),
+            QueryTarget::Deployment(subgraph_id.clone(), Default::default()),
             false,
         )
         .await
@@ -544,12 +543,12 @@ fn build_store() -> (Arc<Store>, ConnectionPool, Config, Arc<SubscriptionManager
     }
     opt.store_connection_pool_size = CONN_POOL_SIZE;
 
-    let config = Config::load(&*LOGGER, &opt)
-        .expect(&format!("config is not valid (file={:?})", &opt.config));
-    let registry = Arc::new(MockMetricsRegistry::new());
+    let config = Config::load(&LOGGER, &opt)
+        .unwrap_or_else(|_| panic!("config is not valid (file={:?})", &opt.config));
+    let registry = Arc::new(MetricsRegistry::mock());
     std::thread::spawn(move || {
         STORE_RUNTIME.handle().block_on(async {
-            let builder = StoreBuilder::new(&*LOGGER, &*NODE_ID, &config, None, registry).await;
+            let builder = StoreBuilder::new(&LOGGER, &NODE_ID, &config, None, registry).await;
             let subscription_manager = builder.subscription_manager();
             let primary_pool = builder.primary_pool();
 

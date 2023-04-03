@@ -143,7 +143,7 @@ impl bc::TriggerFilter<Chain> for TriggerFilter {
         &mut self,
         data_sources: impl Iterator<Item = <Chain as bc::Blockchain>::DataSourceTemplate>,
     ) {
-        for data_source in data_sources.into_iter() {
+        for data_source in data_sources {
             self.log
                 .extend(EthereumLogFilter::from_mapping(&data_source.mapping));
 
@@ -195,9 +195,9 @@ pub(crate) struct EthereumLogFilter {
     wildcard_events: HashMap<EventSignature, bool>,
 }
 
-impl Into<Vec<LogFilter>> for EthereumLogFilter {
-    fn into(self) -> Vec<LogFilter> {
-        self.eth_get_logs_filters()
+impl From<EthereumLogFilter> for Vec<LogFilter> {
+    fn from(val: EthereumLogFilter) -> Self {
+        val.eth_get_logs_filters()
             .map(
                 |EthGetLogsFilter {
                      contracts,
@@ -326,8 +326,8 @@ impl EthereumLogFilter {
         // Start with the wildcard event filters.
         let mut filters = self
             .wildcard_events
-            .into_iter()
-            .map(|(event, _)| EthGetLogsFilter::from_event(event))
+            .into_keys()
+            .map(EthGetLogsFilter::from_event)
             .collect_vec();
 
         // The current algorithm is to repeatedly find the maximum cardinality vertex and turn all
@@ -349,7 +349,7 @@ impl EthereumLogFilter {
                 // Sanity checks:
                 // - The filter is not a wildcard because all nodes have neighbors.
                 // - The graph is bipartite.
-                assert!(filter.contracts.len() > 0 && filter.event_signatures.len() > 0);
+                assert!(!filter.contracts.is_empty() && !filter.event_signatures.is_empty());
                 assert!(filter.contracts.len() == 1 || filter.event_signatures.len() == 1);
                 filters.push(filter);
             };
@@ -480,7 +480,7 @@ impl EthereumCallFilter {
     pub fn from_data_sources<'a>(iter: impl IntoIterator<Item = &'a DataSource>) -> Self {
         iter.into_iter()
             .filter_map(|data_source| data_source.address.map(|addr| (addr, data_source)))
-            .map(|(contract_addr, data_source)| {
+            .flat_map(|(contract_addr, data_source)| {
                 let start_block = data_source.start_block;
                 data_source
                     .mapping
@@ -491,7 +491,6 @@ impl EthereumCallFilter {
                         (start_block, contract_addr, [sig[0], sig[1], sig[2], sig[3]])
                     })
             })
-            .flatten()
             .collect()
     }
 
@@ -548,9 +547,9 @@ impl FromIterator<(BlockNumber, Address, FunctionSelector)> for EthereumCallFilt
         let mut lookup: HashMap<Address, (BlockNumber, HashSet<FunctionSelector>)> = HashMap::new();
         iter.into_iter()
             .for_each(|(start_block, address, function_signature)| {
-                if !lookup.contains_key(&address) {
-                    lookup.insert(address, (start_block, HashSet::default()));
-                }
+                lookup
+                    .entry(address)
+                    .or_insert((start_block, HashSet::default()));
                 lookup.get_mut(&address).map(|set| {
                     if set.0 > start_block {
                         set.0 = start_block
@@ -573,7 +572,7 @@ impl From<&EthereumBlockFilter> for EthereumCallFilter {
                 .contract_addresses
                 .iter()
                 .map(|(start_block_opt, address)| {
-                    (address.clone(), (*start_block_opt, HashSet::default()))
+                    (*address, (*start_block_opt, HashSet::default()))
                 })
                 .collect::<HashMap<Address, (BlockNumber, HashSet<FunctionSelector>)>>(),
             wildcard_signatures: HashSet::new(),
@@ -610,7 +609,7 @@ impl EthereumBlockFilter {
     pub fn from_mapping(mapping: &Mapping) -> Self {
         Self {
             contract_addresses: HashSet::new(),
-            trigger_every_block: mapping.block_handlers.len() != 0,
+            trigger_every_block: !mapping.block_handlers.is_empty(),
         }
     }
 
@@ -638,12 +637,9 @@ impl EthereumBlockFilter {
                 filter_opt.extend(Self {
                     trigger_every_block: has_block_handler_without_filter,
                     contract_addresses: if has_block_handler_with_call_filter {
-                        vec![(
-                            data_source.start_block,
-                            data_source.address.unwrap().to_owned(),
-                        )]
-                        .into_iter()
-                        .collect()
+                        vec![(data_source.start_block, data_source.address.unwrap())]
+                            .into_iter()
+                            .collect()
                     } else {
                         HashSet::default()
                     },
@@ -727,7 +723,7 @@ impl From<ProviderStatus> for f64 {
 }
 
 const STATUS_HELP: &str = "0 = ok, 1 = net_version failed, 2 = get genesis failed, 3 = net_version timeout, 4 = get genesis timeout";
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ProviderEthRpcMetrics {
     request_duration: Box<HistogramVec>,
     errors: Box<CounterVec>,
@@ -735,7 +731,7 @@ pub struct ProviderEthRpcMetrics {
 }
 
 impl ProviderEthRpcMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>) -> Self {
         let request_duration = registry
             .new_histogram_vec(
                 "eth_rpc_request_duration",
@@ -791,7 +787,7 @@ pub struct SubgraphEthRpcMetrics {
 }
 
 impl SubgraphEthRpcMetrics {
-    pub fn new(registry: Arc<dyn MetricsRegistry>, subgraph_hash: &str) -> Self {
+    pub fn new(registry: Arc<MetricsRegistry>, subgraph_hash: &str) -> Self {
         let request_duration = registry
             .global_gauge_vec(
                 "deployment_eth_rpc_request_duration",
@@ -832,8 +828,6 @@ impl SubgraphEthRpcMetrics {
 /// or a remote node over RPC.
 #[async_trait]
 pub trait EthereumAdapter: Send + Sync + 'static {
-    fn url_hostname(&self) -> &str;
-
     /// The `provider.label` from the adapter's configuration
     fn provider(&self) -> &str;
 
@@ -1117,7 +1111,7 @@ mod tests {
         );
 
         let mut combined_filter = &firehose_filter
-            .get(COMBINED_FILTER_TYPE_URL.into())
+            .get(COMBINED_FILTER_TYPE_URL)
             .expect("a CombinedFilter")
             .value[..];
 
@@ -1185,7 +1179,7 @@ mod tests {
         );
 
         let mut combined_filter = &firehose_filter
-            .get(COMBINED_FILTER_TYPE_URL.into())
+            .get(COMBINED_FILTER_TYPE_URL)
             .expect("a CombinedFilter")
             .value[..];
 
@@ -1520,8 +1514,7 @@ fn complete_log_filter() {
             assert_eq!(
                 logs_filters
                     .iter()
-                    .map(|l| l.contracts.iter())
-                    .flatten()
+                    .flat_map(|l| l.contracts.iter())
                     .copied()
                     .collect::<BTreeSet<_>>(),
                 contracts
@@ -1529,8 +1522,7 @@ fn complete_log_filter() {
             assert_eq!(
                 logs_filters
                     .iter()
-                    .map(|l| l.event_signatures.iter())
-                    .flatten()
+                    .flat_map(|l| l.event_signatures.iter())
                     .copied()
                     .collect::<BTreeSet<_>>(),
                 events

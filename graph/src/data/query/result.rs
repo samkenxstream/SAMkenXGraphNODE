@@ -78,6 +78,10 @@ impl QueryResults {
     pub fn traces(&self) -> Vec<&Trace> {
         self.results.iter().map(|res| &res.trace).collect()
     }
+
+    pub fn errors(&self) -> Vec<QueryError> {
+        self.results.iter().flat_map(|r| r.errors.clone()).collect()
+    }
 }
 
 impl Serialize for QueryResults {
@@ -91,7 +95,14 @@ impl Serialize for QueryResults {
         if has_errors {
             len += 1;
         }
-
+        let first_trace = self
+            .results
+            .iter()
+            .find(|r| !r.trace.is_none())
+            .map(|r| &r.trace);
+        if first_trace.is_some() {
+            len += 1;
+        }
         let mut state = serializer.serialize_struct("QueryResults", len)?;
 
         // Serialize data.
@@ -117,7 +128,7 @@ impl Serialize for QueryResults {
             impl Serialize for SerError<'_> {
                 fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
                     let mut seq = serializer.serialize_seq(None)?;
-                    for err in self.0.results.iter().map(|r| &r.errors).flatten() {
+                    for err in self.0.results.iter().flat_map(|r| &r.errors) {
                         seq.serialize_element(err)?;
                     }
                     seq.end()
@@ -127,6 +138,9 @@ impl Serialize for QueryResults {
             state.serialize_field("errors", &SerError(self))?;
         }
 
+        if let Some(trace) = first_trace {
+            state.serialize_field("trace", trace)?;
+        }
         state.end()
     }
 }

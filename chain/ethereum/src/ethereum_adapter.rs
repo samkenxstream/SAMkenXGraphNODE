@@ -1,11 +1,11 @@
 use futures::future;
 use futures::prelude::*;
 use futures03::{future::BoxFuture, stream::FuturesUnordered};
+use graph::blockchain::client::ChainClient;
 use graph::blockchain::BlockHash;
 use graph::blockchain::ChainIdentifier;
 use graph::components::transaction_receipt::LightTransactionReceipt;
 use graph::data::subgraph::UnifiedMappingApiVersion;
-use graph::data::subgraph::API_VERSION_0_0_5;
 use graph::data::subgraph::API_VERSION_0_0_7;
 use graph::prelude::ethabi::ParamType;
 use graph::prelude::ethabi::Token;
@@ -44,6 +44,8 @@ use std::time::Instant;
 
 use crate::adapter::ProviderStatus;
 use crate::chain::BlockFinality;
+use crate::Chain;
+use crate::NodeCapabilities;
 use crate::{
     adapter::{
         EthGetLogsFilter, EthereumAdapter as EthereumAdapterTrait, EthereumBlockFilter,
@@ -55,15 +57,14 @@ use crate::{
     TriggerFilter, ENV_VARS,
 };
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EthereumAdapter {
     logger: Logger,
-    url_hostname: Arc<String>,
-    /// The label for the provider from the configuration
     provider: String,
     web3: Arc<Web3<Transport>>,
     metrics: Arc<ProviderEthRpcMetrics>,
     supports_eip_1898: bool,
+    call_only: bool,
 }
 
 /// Gas limit for `eth_call`. The value of 50_000_000 is a protocol-wide parameter so this
@@ -81,30 +82,27 @@ impl CheapClone for EthereumAdapter {
         Self {
             logger: self.logger.clone(),
             provider: self.provider.clone(),
-            url_hostname: self.url_hostname.cheap_clone(),
             web3: self.web3.cheap_clone(),
             metrics: self.metrics.cheap_clone(),
             supports_eip_1898: self.supports_eip_1898,
+            call_only: self.call_only,
         }
     }
 }
 
 impl EthereumAdapter {
+    pub fn is_call_only(&self) -> bool {
+        self.call_only
+    }
+
     pub async fn new(
         logger: Logger,
         provider: String,
-        url: &str,
         transport: Transport,
         provider_metrics: Arc<ProviderEthRpcMetrics>,
         supports_eip_1898: bool,
+        call_only: bool,
     ) -> Self {
-        // Unwrap: The transport was constructed with this url, so it is valid and has a host.
-        let hostname = graph::url::Url::parse(url)
-            .unwrap()
-            .host_str()
-            .unwrap()
-            .to_string();
-
         let web3 = Arc::new(Web3::new(transport));
 
         // Use the client version to check if it is ganache. For compatibility with unit tests, be
@@ -119,10 +117,10 @@ impl EthereumAdapter {
         EthereumAdapter {
             logger,
             provider,
-            url_hostname: Arc::new(hostname),
             web3,
             metrics: provider_metrics,
             supports_eip_1898: supports_eip_1898 && !is_ganache,
+            call_only,
         }
     }
 
@@ -134,6 +132,8 @@ impl EthereumAdapter {
         to: BlockNumber,
         addresses: Vec<H160>,
     ) -> Result<Vec<Trace>, Error> {
+        assert!(!self.call_only);
+
         let eth = self.clone();
         let retry_log_message =
             format!("trace_filter RPC call for block range: [{}..{}]", from, to);
@@ -168,7 +168,7 @@ impl EthereumAdapter {
                         .filter(trace_filter)
                         .await
                         .map(move |traces| {
-                            if traces.len() > 0 {
+                            if !traces.is_empty() {
                                 if to == from {
                                     debug!(
                                         logger_for_triggers,
@@ -226,6 +226,8 @@ impl EthereumAdapter {
         filter: Arc<EthGetLogsFilter>,
         too_many_logs_fingerprints: &'static [&'static str],
     ) -> Result<Vec<Log>, TimeoutError<web3::error::Error>> {
+        assert!(!self.call_only);
+
         let eth_adapter = self.clone();
         let retry_log_message = format!("eth_getLogs RPC call for block range: [{}..{}]", from, to);
         retry(retry_log_message, &logger)
@@ -291,8 +293,8 @@ impl EthereumAdapter {
             true => 1,
         };
 
-        let eth = self.clone();
-        let logger = logger.to_owned();
+        let eth = self;
+        let logger = logger.clone();
         stream::unfold(from, move |start| {
             if start > to {
                 return None;
@@ -501,7 +503,7 @@ impl EthereumAdapter {
                     let env_geth_call_errors = ENV_VARS.geth_eth_call_errors.iter();
                     let mut geth_execution_errors = GETH_EXECUTION_ERRORS
                         .iter()
-                        .map(|s| *s)
+                        .copied()
                         .chain(env_geth_call_errors.map(|s| s.as_str()));
 
                     let as_solidity_revert_with_reason = |bytes: &[u8]| {
@@ -591,7 +593,7 @@ impl EthereumAdapter {
                         .compat()
                         .from_err::<Error>()
                         .and_then(move |block| {
-                            block.map(|block| Arc::new(block)).ok_or_else(|| {
+                            block.map(Arc::new).ok_or_else(|| {
                                 anyhow::anyhow!("Ethereum node did not find block {:?}", hash)
                             })
                         })
@@ -657,7 +659,7 @@ impl EthereumAdapter {
         block_ptr: BlockPtr,
     ) -> Result<bool, Error> {
         let block_hash = self
-            .block_hash_by_block_number(&logger, block_ptr.number)
+            .block_hash_by_block_number(logger, block_ptr.number)
             .compat()
             .await?;
         block_hash
@@ -701,8 +703,12 @@ impl EthereumAdapter {
     ) -> Box<dyn Stream<Item = EthereumCall, Error = Error> + Send + 'a> {
         let eth = self.clone();
 
-        let mut addresses: Vec<H160> = call_filter
-            .contract_addresses_function_signatures
+        let EthereumCallFilter {
+            contract_addresses_function_signatures,
+            wildcard_signatures,
+        } = call_filter;
+
+        let mut addresses: Vec<H160> = contract_addresses_function_signatures
             .iter()
             .filter(|(_addr, (start_block, _fsigs))| start_block <= &to)
             .map(|(addr, (_start_block, _fsigs))| *addr)
@@ -710,27 +716,28 @@ impl EthereumAdapter {
             .into_iter()
             .collect::<Vec<H160>>();
 
-        if addresses.is_empty() {
+        if addresses.is_empty() && wildcard_signatures.is_empty() {
             // The filter has no started data sources in the requested range, nothing to do.
             // This prevents an expensive call to `trace_filter` with empty `addresses`.
             return Box::new(stream::empty());
         }
 
-        if addresses.len() > 100 {
+        // if wildcard_signatures is on, we can't filter by topic so we need to get all the traces.
+        if addresses.len() > 100 || !wildcard_signatures.is_empty() {
             // If the address list is large, request all traces, this avoids generating huge
             // requests and potentially getting 413 errors.
             addresses = vec![];
         }
 
         Box::new(
-            eth.trace_stream(&logger, subgraph_metrics, from, to, addresses)
+            eth.trace_stream(logger, subgraph_metrics, from, to, addresses)
                 .filter_map(|trace| EthereumCall::try_from_trace(&trace))
                 .filter(move |call| {
                     // `trace_filter` can only filter by calls `to` an address and
                     // a block range. Since subgraphs are subscribing to calls
                     // for a specific contract function an additional filter needs
                     // to be applied
-                    call_filter.matches(&call)
+                    call_filter.matches(call)
                 }),
         )
     }
@@ -746,7 +753,7 @@ impl EthereumAdapter {
         let addresses = Vec::new();
         let traces = eth
             .trace_stream(
-                &logger,
+                logger,
                 subgraph_metrics.clone(),
                 block_number,
                 block_number,
@@ -821,10 +828,6 @@ impl EthereumAdapter {
 
 #[async_trait]
 impl EthereumAdapterTrait for EthereumAdapter {
-    fn url_hostname(&self) -> &str {
-        &self.url_hostname
-    }
-
     fn provider(&self) -> &str {
         &self.provider
     }
@@ -880,8 +883,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                             metrics.set_status(ProviderStatus::GenesisFail, &provider);
                             e
                         })?
-                        .map(|gen_block| gen_block.hash.map(BlockHash::from))
-                        .flatten()
+                        .and_then(|gen_block| gen_block.hash.map(BlockHash::from))
                         .ok_or_else(|| anyhow!("Ethereum node could not find genesis block"))
                 }
             })
@@ -982,7 +984,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         block_hash: H256,
     ) -> Box<dyn Future<Item = LightEthereumBlock, Error = Error> + Send> {
         Box::new(
-            self.block_by_hash(&logger, block_hash)
+            self.block_by_hash(logger, block_hash)
                 .and_then(move |block_opt| {
                     block_opt.ok_or_else(move || {
                         anyhow!(
@@ -1144,7 +1146,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
             block_number
         );
         Box::new(
-            retry(retry_log_message, &logger)
+            retry(retry_log_message, logger)
                 .no_limit()
                 .timeout_secs(ENV_VARS.json_rpc_timeout.as_secs())
                 .run(move || {
@@ -1153,7 +1155,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                         web3.eth()
                             .block(BlockId::Number(block_number.into()))
                             .await
-                            .map(|block_opt| block_opt.map(|block| block.hash).flatten())
+                            .map(|block_opt| block_opt.and_then(|block| block.hash))
                             .map_err(Error::from)
                     }
                 })
@@ -1197,7 +1199,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
         };
 
         debug!(logger, "eth_call";
-            "address" => hex::encode(&call.address),
+            "address" => hex::encode(call.address),
             "data" => hex::encode(&call_data)
         );
 
@@ -1343,7 +1345,7 @@ pub(crate) async fn blocks_with_triggers(
     // Scan for Logs
     if !filter.log.is_empty() {
         let logs_future = get_logs_and_transactions(
-            eth.clone(),
+            &eth,
             &logger,
             subgraph_metrics.clone(),
             from,
@@ -1368,7 +1370,7 @@ pub(crate) async fn blocks_with_triggers(
 
     // Scan for Blocks
     if filter.block.trigger_every_block {
-        let block_future = adapter
+        let block_future = eth
             .block_range_to_ptrs(logger.clone(), from, to)
             .map(move |ptrs| {
                 ptrs.into_iter()
@@ -1397,14 +1399,14 @@ pub(crate) async fn blocks_with_triggers(
     }
 
     // Get hash for "to" block
-    let to_hash_fut = adapter
+    let to_hash_fut = eth
         .block_hash_by_block_number(&logger, to)
         .and_then(|hash| match hash {
             Some(hash) => Ok(hash),
             None => {
                 warn!(logger,
                       "Ethereum endpoint is behind";
-                      "url" => eth.url_hostname()
+                      "url" => eth.provider()
                 );
                 bail!("Block {} not found in the chain", to)
             }
@@ -1431,15 +1433,18 @@ pub(crate) async fn blocks_with_triggers(
 
     // Make sure `to` is included, even if empty.
     block_hashes.insert(to_hash);
-    triggers_by_block.entry(to).or_insert(Vec::new());
+    triggers_by_block.entry(to).or_default();
 
-    let blocks = adapter
+    let logger2 = logger.cheap_clone();
+
+    let blocks = eth
         .load_blocks(logger.cheap_clone(), chain_store.clone(), block_hashes)
         .and_then(
             move |block| match triggers_by_block.remove(&(block.number() as BlockNumber)) {
                 Some(triggers) => Ok(BlockWithTriggers::new(
                     BlockFinality::Final(block),
                     triggers,
+                    &logger2,
                 )),
                 None => Err(anyhow!(
                     "block {} not found in `triggers_by_block`",
@@ -1452,14 +1457,10 @@ pub(crate) async fn blocks_with_triggers(
         .await?;
 
     // Filter out call triggers that come from unsuccessful transactions
-    let mut blocks = if unified_api_version.equal_or_greater_than(&API_VERSION_0_0_5) {
-        let futures = blocks.into_iter().map(|block| {
-            filter_call_triggers_from_unsuccessful_transactions(block, &eth, &chain_store, &logger)
-        });
-        futures03::future::try_join_all(futures).await?
-    } else {
-        blocks
-    };
+    let futures = blocks.into_iter().map(|block| {
+        filter_call_triggers_from_unsuccessful_transactions(block, &eth, &chain_store, &logger)
+    });
+    let mut blocks = futures03::future::try_join_all(futures).await?;
 
     blocks.sort_by_key(|block| block.ptr().number);
 
@@ -1486,9 +1487,10 @@ pub(crate) async fn blocks_with_triggers(
 }
 
 pub(crate) async fn get_calls(
-    adapter: &EthereumAdapter,
+    client: &Arc<ChainClient<Chain>>,
     logger: Logger,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
+    capabilities: &NodeCapabilities,
     requires_traces: bool,
     block: BlockFinality,
 ) -> Result<BlockFinality, Error> {
@@ -1508,7 +1510,9 @@ pub(crate) async fn get_calls(
             let calls = if !requires_traces || ethereum_block.transaction_receipts.is_empty() {
                 vec![]
             } else {
-                adapter
+                client
+                    .rpc()?
+                    .cheapest_with(capabilities)?
                     .calls_in_block(
                         &logger,
                         subgraph_metrics.clone(),
@@ -1695,7 +1699,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
     let futures = transactions_without_receipt
         .iter()
         .map(|transaction| async move {
-            fetch_receipt_from_ethereum_client(&eth, &transaction.hash)
+            fetch_receipt_from_ethereum_client(eth, &transaction.hash)
                 .await
                 .map(|receipt| (transaction, receipt))
         });
@@ -1794,7 +1798,7 @@ async fn fetch_transaction_receipts_in_batch(
         .map(move |hash| {
             let logger = logger.cheap_clone();
             eth.transaction_receipt(hash)
-                .map_err(|web3_error| IngestorError::from(web3_error))
+                .map_err(IngestorError::from)
                 .and_then(move |some_receipt| async move {
                     resolve_transaction_receipt(some_receipt, hash, block_hash, logger)
                 })
@@ -1847,7 +1851,12 @@ fn resolve_transaction_receipt(
             // Check if the receipt has a block hash and is for the right block. Parity nodes seem
             // to return receipts with no block hash when a transaction is no longer in the main
             // chain, so treat that case the same as a receipt being absent entirely.
-            if receipt.block_hash != Some(block_hash) {
+            //
+            // Also as a sanity check against provider nonsense, check that the receipt transaction
+            // hash and the requested transaction hash match.
+            if receipt.block_hash != Some(block_hash)
+                || transaction_hash != receipt.transaction_hash
+            {
                 info!(
                     logger, "receipt block mismatch";
                     "receipt_block_hash" =>
@@ -1855,13 +1864,14 @@ fn resolve_transaction_receipt(
                     "block_hash" =>
                         block_hash.to_string(),
                     "tx_hash" => transaction_hash.to_string(),
+                    "receipt_tx_hash" => receipt.transaction_hash.to_string(),
                 );
 
                 // If the receipt came from a different block, then the Ethereum node no longer
                 // considers this block to be in the main chain. Nothing we can do from here except
                 // give up trying to ingest this block. There is no way to get the transaction
                 // receipt from this block.
-                Err(IngestorError::BlockUnavailable(block_hash.clone()))
+                Err(IngestorError::BlockUnavailable(block_hash))
             } else {
                 Ok(receipt)
             }
@@ -1885,7 +1895,7 @@ fn resolve_transaction_receipt(
 
 /// Retrieves logs and the associated transaction receipts, if required by the [`EthereumLogFilter`].
 async fn get_logs_and_transactions(
-    adapter: Arc<EthereumAdapter>,
+    adapter: &Arc<EthereumAdapter>,
     logger: &Logger,
     subgraph_metrics: Arc<SubgraphEthRpcMetrics>,
     from: BlockNumber,
@@ -1935,7 +1945,7 @@ async fn get_logs_and_transactions(
 
     // Obtain receipts externally
     let transaction_receipts_by_hash = get_transaction_receipts_for_transaction_hashes(
-        &adapter,
+        adapter,
         &transaction_hashes_by_block,
         subgraph_metrics,
         logger.cheap_clone(),
@@ -2019,7 +2029,7 @@ async fn get_transaction_receipts_for_transaction_hashes(
         if !unique_transaction_hashes.remove(&receipt.transaction_hash) {
             bail!("Received a receipt for a different transaction hash")
         }
-        if let Vacant(entry) = receipts_by_hash.entry(receipt.transaction_hash.clone()) {
+        if let Vacant(entry) = receipts_by_hash.entry(receipt.transaction_hash) {
             entry.insert(receipt);
         } else {
             bail!("Received a duplicate transaction receipt")

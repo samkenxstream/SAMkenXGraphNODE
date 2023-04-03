@@ -8,7 +8,7 @@ use std::{
 use graph::{
     blockchain::ChainIdentifier,
     components::store::BlockStore as BlockStoreTrait,
-    prelude::{error, warn, BlockNumber, BlockPtr, Logger},
+    prelude::{error, warn, BlockNumber, BlockPtr, Logger, ENV_VARS},
 };
 use graph::{
     constraint_violation,
@@ -20,8 +20,9 @@ use graph::{
 };
 
 use crate::{
-    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool,
-    primary::Mirror as PrimaryMirror, ChainStore, NotificationSender, Shard, PRIMARY_SHARD,
+    chain_head_listener::ChainHeadUpdateSender, chain_store::ChainStoreMetrics,
+    connection_pool::ConnectionPool, primary::Mirror as PrimaryMirror, ChainStore,
+    NotificationSender, Shard, PRIMARY_SHARD,
 };
 
 #[cfg(debug_assertions)]
@@ -183,6 +184,7 @@ pub struct BlockStore {
     sender: Arc<NotificationSender>,
     mirror: PrimaryMirror,
     chain_head_cache: TimedCache<String, HashMap<String, BlockPtr>>,
+    chain_store_metrics: Arc<ChainStoreMetrics>,
 }
 
 impl BlockStore {
@@ -204,6 +206,7 @@ impl BlockStore {
         // shard -> pool
         pools: HashMap<Shard, ConnectionPool>,
         sender: Arc<NotificationSender>,
+        chain_store_metrics: Arc<ChainStoreMetrics>,
     ) -> Result<Self, StoreError> {
         // Cache chain head pointers for this long when returning
         // information from `chain_head_pointers`
@@ -220,6 +223,7 @@ impl BlockStore {
             sender,
             mirror,
             chain_head_cache,
+            chain_store_metrics,
         };
 
         fn reduce_idents(
@@ -372,6 +376,8 @@ impl BlockStore {
             status,
             sender,
             pool,
+            ENV_VARS.store.recent_blocks_cache_capacity,
+            self.chain_store_metrics.clone(),
         );
         if create {
             store.create(&ident)?;

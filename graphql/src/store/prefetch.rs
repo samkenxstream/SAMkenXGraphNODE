@@ -5,10 +5,9 @@ use anyhow::{anyhow, Error};
 use graph::constraint_violation;
 use graph::data::query::Trace;
 use graph::data::value::{Object, Word};
-use graph::prelude::{r, CacheWeight};
+use graph::prelude::{r, CacheWeight, CheapClone};
 use graph::slog::warn;
 use graph::util::cache_weight;
-use lazy_static::lazy_static;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Instant;
@@ -17,10 +16,9 @@ use graph::{components::store::EntityType, data::graphql::*};
 use graph::{
     data::graphql::ext::DirectiveFinder,
     prelude::{
-        s, ApiSchema, AttributeNames, BlockNumber, ChildMultiplicity, EntityCollection,
-        EntityFilter, EntityLink, EntityOrder, EntityWindow, Logger, ParentLink,
-        QueryExecutionError, QueryStore, StoreError, Value as StoreValue, WindowAttribute,
-        ENV_VARS,
+        s, ApiSchema, AttributeNames, ChildMultiplicity, EntityCollection, EntityFilter,
+        EntityLink, EntityOrder, EntityWindow, ParentLink, QueryExecutionError, StoreError,
+        Value as StoreValue, WindowAttribute, ENV_VARS,
     },
 };
 
@@ -30,11 +28,7 @@ use crate::schema::ast as sast;
 use crate::store::query::build_query;
 use crate::store::StoreResolver;
 
-lazy_static! {
-    static ref ARG_FIRST: String = String::from("first");
-    static ref ARG_SKIP: String = String::from("skip");
-    static ref ARG_ID: String = String::from("id");
-}
+pub const ARG_ID: &str = "id";
 
 /// Intermediate data structure to hold the results of prefetching entities
 /// and their nested associations. For each association of `entity`, `children`
@@ -178,7 +172,7 @@ impl Node {
     fn id(&self) -> Result<String, Error> {
         match self.get("id") {
             None => Err(anyhow!("Entity is missing an `id` attribute")),
-            Some(r::Value::String(s)) => Ok(s.to_owned()),
+            Some(r::Value::String(s)) => Ok(s.clone()),
             _ => Err(anyhow!("Entity has non-string `id` attribute")),
         }
     }
@@ -301,7 +295,7 @@ impl<'a> JoinCond<'a> {
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
                             .filter_map(|(id, node)| {
-                                node.get(*child_field)
+                                node.get(child_field)
                                     .and_then(|value| value.as_str())
                                     .map(|child_id| (id, child_id.to_owned()))
                             })
@@ -316,7 +310,7 @@ impl<'a> JoinCond<'a> {
                         let (ids, child_ids): (Vec<_>, Vec<_>) = parents_by_id
                             .into_iter()
                             .filter_map(|(id, node)| {
-                                node.get(*child_field)
+                                node.get(child_field)
                                     .and_then(|value| match value {
                                         r::Value::List(values) => {
                                             let values: Vec<_> = values
@@ -419,7 +413,7 @@ impl<'a> Join<'a> {
             // query are always joined first, and may then be overwritten by the merged selection
             // set under the object type condition. See also: e0d6da3e-60cf-41a5-b83c-b60a7a766d4a
             let values = parent.id().ok().and_then(|id| grouped.get(&*id).cloned());
-            parent.set_children(response_key.to_owned(), values.unwrap_or(vec![]));
+            parent.set_children(response_key.to_owned(), values.unwrap_or_default());
         }
     }
 
@@ -443,7 +437,7 @@ impl<'a> Join<'a> {
                 parents_by_id.dedup_by(|(id1, _), (id2, _)| id1 == id2);
 
                 let (ids, link) = cond.entity_link(parents_by_id, multiplicity);
-                let child_type: EntityType = cond.child_type.to_owned();
+                let child_type: EntityType = cond.child_type.clone();
                 let column_names = match column_names_map.get(&child_type) {
                     Some(column_names) => column_names.clone(),
                     None => AttributeNames::All,
@@ -485,16 +479,11 @@ pub fn run(
 ) -> Result<(r::Value, Trace), Vec<QueryExecutionError>> {
     execute_root_selection_set(resolver, ctx, selection_set).map(|(nodes, trace)| {
         graphql_metrics.observe_query_result_size(nodes.weight());
-        let obj = Object::from_iter(
-            nodes
+        let obj = Object::from_iter(nodes.into_iter().flat_map(|node| {
+            node.children
                 .into_iter()
-                .map(|node| {
-                    node.children.into_iter().map(|(key, nodes)| {
-                        (format!("prefetch:{}", key), node_list_as_value(nodes))
-                    })
-                })
-                .flatten(),
-        );
+                .map(|(key, nodes)| (format!("prefetch:{}", key), node_list_as_value(nodes)))
+        }));
         (r::Value::Object(obj), trace)
     })
 }
@@ -505,7 +494,13 @@ fn execute_root_selection_set(
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &a::SelectionSet,
 ) -> Result<(Vec<Node>, Trace), Vec<QueryExecutionError>> {
-    let trace = Trace::root(ctx.query.query_text.clone());
+    let trace = Trace::root(
+        &ctx.query.query_text,
+        &ctx.query.variables_text,
+        &ctx.query.query_id,
+        resolver.block_number(),
+        ctx.trace,
+    );
     // Execute the root selection set against the root query type
     execute_selection_set(resolver, ctx, make_root_node(), trace, selection_set)
 }
@@ -514,14 +509,14 @@ fn check_result_size<'a>(
     ctx: &'a ExecutionContext<impl Resolver>,
     size: usize,
 ) -> Result<(), QueryExecutionError> {
+    if size > ENV_VARS.graphql.warn_result_size {
+        warn!(ctx.logger, "Large query result"; "size" => size, "query_id" => &ctx.query.query_id);
+    }
     if size > ENV_VARS.graphql.error_result_size {
         return Err(QueryExecutionError::ResultTooBig(
             size,
             ENV_VARS.graphql.error_result_size,
         ));
-    }
-    if size > ENV_VARS.graphql.warn_result_size {
-        warn!(ctx.logger, "Large query result"; "size" => size, "query_id" => &ctx.query.query_id);
     }
     Ok(())
 }
@@ -642,18 +637,12 @@ fn execute_field(
     };
 
     fetch(
-        ctx.logger.clone(),
-        resolver.store.as_ref(),
+        resolver,
+        ctx,
         parents,
         join,
-        ctx.query.schema.as_ref(),
         field,
         multiplicity,
-        ctx.query.schema.types_for_interface(),
-        resolver.block_number(),
-        ctx.max_first,
-        ctx.max_skip,
-        ctx.query.query_id.clone(),
         selected_attrs,
     )
     .map_err(|e| vec![e])
@@ -663,31 +652,26 @@ fn execute_field(
 /// in which child field to look for the parent's id/join field. When
 /// `is_single` is `true`, there is at most one child per parent.
 fn fetch(
-    logger: Logger,
-    store: &(impl QueryStore + ?Sized),
+    resolver: &StoreResolver,
+    ctx: &ExecutionContext<impl Resolver>,
     parents: &[&mut Node],
     join: &Join<'_>,
-    schema: &ApiSchema,
     field: &a::Field,
     multiplicity: ChildMultiplicity,
-    types_for_interface: &BTreeMap<EntityType, Vec<s::ObjectType>>,
-    block: BlockNumber,
-    max_first: u32,
-    max_skip: u32,
-    query_id: String,
     selected_attrs: SelectedAttributes,
 ) -> Result<(Vec<Node>, Trace), QueryExecutionError> {
     let mut query = build_query(
         join.child_type,
-        block,
+        resolver.block_number(),
         field,
-        types_for_interface,
-        max_first,
-        max_skip,
+        ctx.query.schema.types_for_interface(),
+        ctx.max_first,
+        ctx.max_skip,
         selected_attrs,
-        schema,
+        &ctx.query.schema,
     )?;
-    query.query_id = Some(query_id);
+    query.trace = ctx.trace;
+    query.query_id = Some(ctx.query.query_id.clone());
 
     if multiplicity == ChildMultiplicity::Single {
         // Suppress 'order by' in lookups of scalar values since
@@ -695,10 +679,10 @@ fn fetch(
         query.order = EntityOrder::Unordered;
     }
 
-    query.logger = Some(logger);
-    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID.as_str()) {
+    query.logger = Some(ctx.logger.cheap_clone());
+    if let Some(r::Value::String(id)) = field.argument_value(ARG_ID) {
         query.filter = Some(
-            EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.to_owned()))
+            EntityFilter::Equal(ARG_ID.to_owned(), StoreValue::from(id.clone()))
                 .and_maybe(query.filter),
         );
     }
@@ -712,12 +696,15 @@ fn fetch(
         }
         query.collection = EntityCollection::Window(windows);
     }
-    store.find_query_values(query).map(|(values, trace)| {
-        (
-            values.into_iter().map(|entity| entity.into()).collect(),
-            trace,
-        )
-    })
+    resolver
+        .store
+        .find_query_values(query)
+        .map(|(values, trace)| {
+            (
+                values.into_iter().map(|entity| entity.into()).collect(),
+                trace,
+            )
+        })
 }
 
 #[derive(Debug, Default, Clone)]

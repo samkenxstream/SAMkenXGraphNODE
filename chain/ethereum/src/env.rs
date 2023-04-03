@@ -11,12 +11,6 @@ lazy_static! {
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct EnvVars {
-    /// Controls if firehose should be preferred over RPC if Firehose endpoints
-    /// are present, if not set, the default behavior is is kept which is to
-    /// automatically favor Firehose.
-    ///
-    /// Set by the flag `GRAPH_ETHEREUM_IS_FIREHOSE_PREFERRED`. On by default.
-    pub is_firehose_preferred: bool,
     /// Additional deterministic errors that have not yet been hardcoded.
     ///
     /// Set by the environment variable `GRAPH_GETH_ETH_CALL_ERRORS`, separated
@@ -26,9 +20,6 @@ pub struct EnvVars {
     /// default value is 2000.
     pub get_logs_max_contracts: usize,
 
-    /// Set by the environment variable `ETHEREUM_REORG_THRESHOLD`. The default
-    /// value is 250 blocks.
-    pub reorg_threshold: BlockNumber,
     /// Set by the environment variable `ETHEREUM_TRACE_STREAM_STEP_SIZE`. The
     /// default value is 50 blocks.
     pub trace_stream_step_size: BlockNumber,
@@ -89,6 +80,9 @@ pub struct EnvVars {
     /// Set by the flag `GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER`. The default value
     /// is 0.
     pub genesis_block_number: u64,
+    /// The time to wait between polls when using polling block ingestor.
+    /// The value is set in millis and the default is 1000.
+    pub ingestor_polling_interval: Duration,
 }
 
 // This does not print any values avoid accidentally leaking any sensitive env vars
@@ -107,7 +101,6 @@ impl EnvVars {
 impl From<Inner> for EnvVars {
     fn from(x: Inner) -> Self {
         Self {
-            is_firehose_preferred: x.is_firehose_preferred.0,
             get_logs_max_contracts: x.get_logs_max_contracts,
             geth_eth_call_errors: x
                 .geth_eth_call_errors
@@ -115,7 +108,6 @@ impl From<Inner> for EnvVars {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect(),
-            reorg_threshold: x.reorg_threshold,
             trace_stream_step_size: x.trace_stream_step_size,
             max_event_only_range: x.max_event_only_range,
             block_batch_size: x.block_batch_size,
@@ -131,6 +123,7 @@ impl From<Inner> for EnvVars {
             cleanup_blocks: x.cleanup_blocks.0,
             target_triggers_per_block_range: x.target_triggers_per_block_range,
             genesis_block_number: x.genesis_block_number,
+            ingestor_polling_interval: Duration::from_millis(x.ingestor_polling_interval),
         }
     }
 }
@@ -143,16 +136,11 @@ impl Default for EnvVars {
 
 #[derive(Clone, Debug, Envconfig)]
 struct Inner {
-    #[envconfig(from = "GRAPH_ETHEREUM_IS_FIREHOSE_PREFERRED", default = "true")]
-    is_firehose_preferred: EnvVarBoolean,
     #[envconfig(from = "GRAPH_GETH_ETH_CALL_ERRORS", default = "")]
     geth_eth_call_errors: String,
     #[envconfig(from = "GRAPH_ETH_GET_LOGS_MAX_CONTRACTS", default = "2000")]
     get_logs_max_contracts: usize,
 
-    // JSON-RPC specific.
-    #[envconfig(from = "ETHEREUM_REORG_THRESHOLD", default = "250")]
-    reorg_threshold: BlockNumber,
     #[envconfig(from = "ETHEREUM_TRACE_STREAM_STEP_SIZE", default = "50")]
     trace_stream_step_size: BlockNumber,
     #[envconfig(from = "GRAPH_ETHEREUM_MAX_EVENT_ONLY_RANGE", default = "500")]
@@ -181,4 +169,6 @@ struct Inner {
     target_triggers_per_block_range: u64,
     #[envconfig(from = "GRAPH_ETHEREUM_GENESIS_BLOCK_NUMBER", default = "0")]
     genesis_block_number: u64,
+    #[envconfig(from = "ETHEREUM_POLLING_INTERVAL", default = "1000")]
+    ingestor_polling_interval: u64,
 }

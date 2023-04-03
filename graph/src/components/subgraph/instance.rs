@@ -21,11 +21,14 @@ pub struct BlockState<C: Blockchain> {
     pub deterministic_errors: Vec<SubgraphError>,
     created_data_sources: Vec<DataSourceTemplateInfo<C>>,
 
+    // Data sources to be transacted into the store.
+    pub persisted_data_sources: Vec<StoredDynamicDataSource>,
+
     // Data sources created in the current handler.
     handler_created_data_sources: Vec<DataSourceTemplateInfo<C>>,
 
-    // offchain data sources to be removed because they've been processed.
-    pub offchain_to_remove: Vec<StoredDynamicDataSource>,
+    // data source that have been processed.
+    pub processed_data_sources: Vec<StoredDynamicDataSource>,
 
     // Marks whether a handler is currently executing.
     in_handler: bool,
@@ -37,8 +40,9 @@ impl<C: Blockchain> BlockState<C> {
             entity_cache: EntityCache::with_current(Arc::new(store), lfu_cache),
             deterministic_errors: Vec::new(),
             created_data_sources: Vec::new(),
+            persisted_data_sources: Vec::new(),
             handler_created_data_sources: Vec::new(),
-            offchain_to_remove: Vec::new(),
+            processed_data_sources: Vec::new(),
             in_handler: false,
         }
     }
@@ -50,8 +54,9 @@ impl<C: Blockchain> BlockState<C> {
             entity_cache,
             deterministic_errors,
             created_data_sources,
+            persisted_data_sources,
             handler_created_data_sources,
-            offchain_to_remove,
+            processed_data_sources,
             in_handler,
         } = self;
 
@@ -61,7 +66,8 @@ impl<C: Blockchain> BlockState<C> {
         }
         deterministic_errors.extend(other.deterministic_errors);
         entity_cache.extend(other.entity_cache);
-        offchain_to_remove.extend(other.offchain_to_remove);
+        processed_data_sources.extend(other.processed_data_sources);
+        persisted_data_sources.extend(other.persisted_data_sources);
     }
 
     pub fn has_errors(&self) -> bool {
@@ -103,5 +109,9 @@ impl<C: Blockchain> BlockState<C> {
     pub fn push_created_data_source(&mut self, ds: DataSourceTemplateInfo<C>) {
         assert!(self.in_handler);
         self.handler_created_data_sources.push(ds);
+    }
+
+    pub fn persist_data_source(&mut self, ds: StoredDynamicDataSource) {
+        self.persisted_data_sources.push(ds)
     }
 }

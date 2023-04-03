@@ -6,10 +6,9 @@ use graph::runtime::{AscIndexId, AscType};
 use graph::runtime::{AscPtr, ToAscObj};
 use graph::{components::store::*, ipfs_client::IpfsClient};
 use graph_chain_ethereum::{Chain, DataSource};
-use graph_mock::MockMetricsRegistry;
 use graph_runtime_wasm::asc_abi::class::{Array, AscBigInt, AscEntity, AscString, Uint8Array};
 use graph_runtime_wasm::{ExperimentalFeatures, ValidModule, WasmInstance};
-use hex;
+
 use semver::Version;
 use std::collections::{BTreeMap, HashMap};
 use std::str::FromStr;
@@ -64,7 +63,7 @@ async fn test_valid_module_and_store_with_timeout(
         subgraph_id_with_api_version(subgraph_id, api_version.clone());
 
     let store = STORE.clone();
-    let metrics_registry = Arc::new(MockMetricsRegistry::new());
+    let metrics_registry = Arc::new(MetricsRegistry::mock());
     let deployment_id = DeploymentHash::new(&subgraph_id_with_api_version).unwrap();
     let deployment = test_store::create_test_subgraph(
         &deployment_id,
@@ -127,7 +126,7 @@ pub async fn test_module(
 pub async fn test_module_latest(subgraph_id: &str, wasm_file: &str) -> WasmInstance<Chain> {
     let version = ENV_VARS.mappings.max_api_version.clone();
     let ds = mock_data_source(
-        &wasm_file_path(wasm_file, API_VERSION_0_0_5.clone()),
+        &wasm_file_path(wasm_file, API_VERSION_0_0_5),
         version.clone(),
     );
     test_valid_module_and_store(subgraph_id, ds, version)
@@ -423,10 +422,7 @@ fn make_thing(id: &str, value: &str) -> (String, EntityModification) {
     data.set("id", id);
     data.set("value", value);
     data.set("extra", USER_DATA);
-    let key = EntityKey {
-        entity_type: EntityType::new("Thing".to_string()),
-        entity_id: id.into(),
-    };
+    let key = EntityKey::data("Thing".to_string(), id);
     (
         format!("{{ \"id\": \"{}\", \"value\": \"{}\"}}", id, value),
         EntityModification::Insert { key, data },
@@ -454,7 +450,7 @@ async fn run_ipfs_map(
         let _runtime_guard = runtime.enter();
 
         let (mut module, _, _) = graph::block_on(test_valid_module_and_store(
-            &subgraph_id,
+            subgraph_id,
             mock_data_source(
                 &wasm_file_path("ipfs_map.wasm", api_version.clone()),
                 api_version.clone(),
@@ -467,7 +463,7 @@ async fn run_ipfs_map(
 
         // Invoke the callback
         let func = module.get_func("ipfsMap").typed().unwrap().clone();
-        let _: () = func.call((value.wasm_ptr(), user_data.wasm_ptr()))?;
+        func.call((value.wasm_ptr(), user_data.wasm_ptr()))?;
         let mut mods = module
             .take_ctx()
             .ctx

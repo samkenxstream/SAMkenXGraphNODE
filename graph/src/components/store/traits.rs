@@ -32,6 +32,8 @@ pub trait EnsLookup: Send + Sync + 'static {
     /// Find the reverse of keccak256 for `hash` through looking it up in the
     /// rainbow table.
     fn find_name(&self, hash: &str) -> Result<Option<String>, StoreError>;
+    // Check if the rainbow table is filled.
+    fn is_table_empty(&self) -> Result<bool, StoreError>;
 }
 
 /// An entry point for all operations that require access to the node's storage
@@ -142,6 +144,10 @@ pub trait SubgraphStore: Send + Sync + 'static {
         deployment: DeploymentId,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
+    /// Initiate a graceful shutdown of the writable that a previous call to
+    /// `writable` might have started
+    async fn stop_subgraph(&self, deployment: &DeploymentLocator) -> Result<(), StoreError>;
+
     /// Return the minimum block pointer of all deployments with this `id`
     /// that we would use to query or copy from; in particular, this will
     /// ignore any instances of this deployment that are in the process of
@@ -150,8 +156,12 @@ pub trait SubgraphStore: Send + Sync + 'static {
 
     async fn is_healthy(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
 
-    /// Find the deployment locators for the subgraph with the given hash
+    /// Find all deployment locators for the subgraph with the given hash.
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
+
+    /// Find the deployment locator for the active deployment with the given
+    /// hash. Returns `None` if there is no deployment with that hash
+    fn active_locator(&self, hash: &str) -> Result<Option<DeploymentLocator>, StoreError>;
 
     /// This migrates subgraphs that existed before the raw_yaml column was added.
     async fn set_manifest_raw_yaml(
@@ -159,18 +169,28 @@ pub trait SubgraphStore: Send + Sync + 'static {
         hash: &DeploymentHash,
         raw_yaml: String,
     ) -> Result<(), StoreError>;
+
+    /// Return `true` if the `instrument` flag for the deployment is set.
+    /// When this flag is set, indexing of the deployment should log
+    /// additional diagnostic information
+    fn instrument(&self, deployment: &DeploymentLocator) -> Result<bool, StoreError>;
 }
 
 pub trait ReadStore: Send + Sync + 'static {
     /// Looks up an entity using the given store key at the latest block.
     fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
 
-    /// Look up multiple entities as of the latest block. Returns a map of
-    /// entities by type.
+    /// Look up multiple entities as of the latest block.
     fn get_many(
         &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError>;
+        keys: BTreeSet<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError>;
+
+    /// Reverse lookup
+    fn get_derived(
+        &self,
+        query_derived: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError>;
 
     fn input_schema(&self) -> Arc<Schema>;
 }
@@ -183,13 +203,40 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
 
     fn get_many(
         &self,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
-        (**self).get_many(ids_for_type)
+        keys: BTreeSet<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        (**self).get_many(keys)
+    }
+
+    fn get_derived(
+        &self,
+        entity_derived: &DerivedEntityQuery,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        (**self).get_derived(entity_derived)
     }
 
     fn input_schema(&self) -> Arc<Schema> {
         (**self).input_schema()
+    }
+}
+
+pub trait DeploymentCursorTracker: Sync + Send + 'static {
+    /// Get a pointer to the most recently processed block in the subgraph.
+    fn block_ptr(&self) -> Option<BlockPtr>;
+
+    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
+    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
+    fn firehose_cursor(&self) -> FirehoseCursor;
+}
+
+// This silly impl is needed until https://github.com/rust-lang/rust/issues/65991 is stable.
+impl<T: ?Sized + DeploymentCursorTracker> DeploymentCursorTracker for Arc<T> {
+    fn block_ptr(&self) -> Option<BlockPtr> {
+        (**self).block_ptr()
+    }
+
+    fn firehose_cursor(&self) -> FirehoseCursor {
+        (**self).firehose_cursor()
     }
 }
 
@@ -198,14 +245,7 @@ impl<T: ?Sized + ReadStore> ReadStore for Arc<T> {
 /// `StoreError::DatabaseUnavailable`. Instead, they will retry the
 /// operation indefinitely until it succeeds.
 #[async_trait]
-pub trait WritableStore: ReadStore {
-    /// Get a pointer to the most recently processed block in the subgraph.
-    fn block_ptr(&self) -> Option<BlockPtr>;
-
-    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
-    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
-    fn block_cursor(&self) -> FirehoseCursor;
-
+pub trait WritableStore: ReadStore + DeploymentCursorTracker {
     /// Start an existing subgraph deployment.
     async fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError>;
 
@@ -271,6 +311,9 @@ pub trait WritableStore: ReadStore {
         &self,
         manifest_idx_and_name: Vec<(u32, String)>,
     ) -> Result<Vec<StoredDynamicDataSource>, StoreError>;
+
+    /// The maximum assigned causality region. Any higher number is therefore free to be assigned.
+    async fn causality_region_curr_val(&self) -> Result<Option<CausalityRegion>, StoreError>;
 
     /// Report the name of the shard in which the subgraph is stored. This
     /// should only be used for reporting and monitoring
@@ -408,6 +451,9 @@ pub trait ChainStore: Send + Sync + 'static {
         &self,
         block_ptr: &H256,
     ) -> Result<Vec<transaction_receipt::LightTransactionReceipt>, StoreError>;
+
+    /// Clears call cache of the chain for the given `from` and `to` block number.
+    async fn clear_call_cache(&self, from: BlockNumber, to: BlockNumber) -> Result<(), Error>;
 }
 
 pub trait EthereumCallCache: Send + Sync + 'static {

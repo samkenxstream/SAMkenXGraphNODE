@@ -124,6 +124,10 @@ pub struct MappingContext<C: Blockchain> {
     pub proof_of_indexing: SharedProofOfIndexing,
     pub host_fns: Arc<Vec<HostFn>>,
     pub debug_fork: Option<Arc<dyn SubgraphFork>>,
+    /// Logger for messages coming from mappings
+    pub mapping_logger: Logger,
+    /// Whether to log details about host fn execution
+    pub instrument: bool,
 }
 
 impl<C: Blockchain> MappingContext<C> {
@@ -136,6 +140,8 @@ impl<C: Blockchain> MappingContext<C> {
             proof_of_indexing: self.proof_of_indexing.cheap_clone(),
             host_fns: self.host_fns.cheap_clone(),
             debug_fork: self.debug_fork.cheap_clone(),
+            mapping_logger: Logger::new(&self.logger, o!("component" => "UserMapping")),
+            instrument: self.instrument,
         }
     }
 }
@@ -194,7 +200,7 @@ impl ValidModule {
             .unwrap(); // Safe because this only panics if size passed is 0.
 
         let engine = &wasmtime::Engine::new(&config)?;
-        let module = wasmtime::Module::from_binary(&engine, &raw_module)?;
+        let module = wasmtime::Module::from_binary(engine, &raw_module)?;
 
         let mut import_name_to_modules: BTreeMap<String, Vec<String>> = BTreeMap::new();
 

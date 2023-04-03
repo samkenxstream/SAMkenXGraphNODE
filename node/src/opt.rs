@@ -37,6 +37,7 @@ pub struct Opt {
 
     #[clap(
         long,
+        env = "GRAPH_START_BLOCK",
         value_name = "BLOCK_HASH:BLOCK_NUMBER",
         help = "block hash and number that the subgraph passed will start indexing at"
     )]
@@ -187,14 +188,6 @@ pub struct Opt {
     pub elasticsearch_password: Option<String>,
     #[clap(
         long,
-        value_name = "MILLISECONDS",
-        default_value = "1000",
-        env = "ETHEREUM_POLLING_INTERVAL",
-        help = "How often to poll the Ethereum node for new blocks"
-    )]
-    pub ethereum_polling_interval: u64,
-    #[clap(
-        long,
         value_name = "DISABLE_BLOCK_INGESTOR",
         env = "DISABLE_BLOCK_INGESTOR",
         help = "Ensures that the block ingestor component does not execute"
@@ -217,11 +210,17 @@ pub struct Opt {
     #[clap(
         long,
         value_name = "IPFS_HASH",
+        env = "GRAPH_DEBUG_FORK",
         help = "IPFS hash of the subgraph manifest that you want to fork"
     )]
     pub debug_fork: Option<String>,
 
-    #[clap(long, value_name = "URL", help = "Base URL for forking subgraphs")]
+    #[clap(
+        long,
+        value_name = "URL",
+        env = "GRAPH_FORK_BASE",
+        help = "Base URL for forking subgraphs"
+    )]
     pub fork_base: Option<String>,
 }
 

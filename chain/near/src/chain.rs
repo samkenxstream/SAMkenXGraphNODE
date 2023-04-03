@@ -1,10 +1,15 @@
-use graph::blockchain::BlockchainKind;
+use graph::anyhow;
+use graph::blockchain::client::ChainClient;
+use graph::blockchain::firehose_block_ingestor::FirehoseBlockIngestor;
+use graph::blockchain::{
+    BasicBlockchainBuilder, BlockIngestor, BlockchainBuilder, BlockchainKind, NoopRuntimeAdapter,
+};
 use graph::cheap_clone::CheapClone;
+use graph::components::store::DeploymentCursorTracker;
 use graph::data::subgraph::UnifiedMappingApiVersion;
-use graph::firehose::{FirehoseEndpoint, FirehoseEndpoints};
+use graph::firehose::FirehoseEndpoint;
 use graph::prelude::{MetricsRegistry, TryFutureExt};
 use graph::{
-    anyhow,
     anyhow::Result,
     blockchain::{
         block_stream::{
@@ -12,7 +17,8 @@ use graph::{
             FirehoseMapper as FirehoseMapperTrait, TriggersAdapter as TriggersAdapterTrait,
         },
         firehose_block_stream::FirehoseBlockStream,
-        BlockHash, BlockPtr, Blockchain, IngestorError, RuntimeAdapter as RuntimeAdapterTrait,
+        BlockHash, BlockPtr, Blockchain, EmptyNodeCapabilities, IngestorError,
+        RuntimeAdapter as RuntimeAdapterTrait,
     },
     components::store::DeploymentLocator,
     firehose::{self as firehose, ForkStep},
@@ -22,9 +28,7 @@ use prost::Message;
 use std::sync::Arc;
 
 use crate::adapter::TriggerFilter;
-use crate::capabilities::NodeCapabilities;
 use crate::data_source::{DataSourceTemplate, UnresolvedDataSourceTemplate};
-use crate::runtime::RuntimeAdapter;
 use crate::trigger::{self, NearTrigger};
 use crate::{
     codec,
@@ -47,26 +51,23 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Chain>>> {
         let adapter = chain
-            .triggers_adapter(&deployment, &NodeCapabilities {}, unified_api_version)
-            .expect(&format!("no adapter for network {}", chain.name,));
-
-        let firehose_endpoint = match chain.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow::format_err!("no firehose endpoint available")),
-        };
+            .triggers_adapter(
+                &deployment,
+                &EmptyNodeCapabilities::default(),
+                unified_api_version,
+            )
+            .unwrap_or_else(|_| panic!("no adapter for network {}", chain.name));
 
         let logger = chain
             .logger_factory
             .subgraph_logger(&deployment)
             .new(o!("component" => "FirehoseBlockStream"));
 
-        let firehose_mapper = Arc::new(FirehoseMapper {
-            endpoint: firehose_endpoint.cheap_clone(),
-        });
+        let firehose_mapper = Arc::new(FirehoseMapper {});
 
         Ok(Box::new(FirehoseBlockStream::new(
             deployment.hash,
-            firehose_endpoint,
+            chain.chain_client(),
             subgraph_current_block,
             block_cursor,
             firehose_mapper,
@@ -80,7 +81,7 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 
     async fn build_polling(
         &self,
-        _chain: Arc<Chain>,
+        _chain: &Chain,
         _deployment: DeploymentLocator,
         _start_blocks: Vec<BlockNumber>,
         _subgraph_current_block: Option<BlockPtr>,
@@ -94,9 +95,9 @@ impl BlockStreamBuilder<Chain> for NearStreamBuilder {
 pub struct Chain {
     logger_factory: LoggerFactory,
     name: String,
-    firehose_endpoints: Arc<FirehoseEndpoints>,
+    client: Arc<ChainClient<Self>>,
     chain_store: Arc<dyn ChainStore>,
-    metrics_registry: Arc<dyn MetricsRegistry>,
+    metrics_registry: Arc<MetricsRegistry>,
     block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
 }
 
@@ -106,22 +107,15 @@ impl std::fmt::Debug for Chain {
     }
 }
 
-impl Chain {
-    pub fn new(
-        logger_factory: LoggerFactory,
-        name: String,
-        chain_store: Arc<dyn ChainStore>,
-        firehose_endpoints: FirehoseEndpoints,
-        metrics_registry: Arc<dyn MetricsRegistry>,
-        block_stream_builder: Arc<dyn BlockStreamBuilder<Self>>,
-    ) -> Self {
+impl BlockchainBuilder<Chain> for BasicBlockchainBuilder {
+    fn build(self) -> Chain {
         Chain {
-            logger_factory,
-            name,
-            firehose_endpoints: Arc::new(firehose_endpoints),
-            chain_store,
-            metrics_registry,
-            block_stream_builder,
+            logger_factory: self.logger_factory,
+            name: self.name,
+            chain_store: self.chain_store,
+            client: Arc::new(ChainClient::new_firehose(self.firehose_endpoints)),
+            metrics_registry: self.metrics_registry,
+            block_stream_builder: Arc::new(NearStreamBuilder {}),
         }
     }
 }
@@ -130,6 +124,7 @@ impl Chain {
 impl Blockchain for Chain {
     const KIND: BlockchainKind = BlockchainKind::Near;
 
+    type Client = ();
     type Block = codec::Block;
 
     type DataSource = DataSource;
@@ -146,7 +141,7 @@ impl Blockchain for Chain {
 
     type TriggerFilter = crate::adapter::TriggerFilter;
 
-    type NodeCapabilities = crate::capabilities::NodeCapabilities;
+    type NodeCapabilities = EmptyNodeCapabilities<Chain>;
 
     fn triggers_adapter(
         &self,
@@ -158,12 +153,11 @@ impl Blockchain for Chain {
         Ok(Arc::new(adapter))
     }
 
-    async fn new_firehose_block_stream(
+    async fn new_block_stream(
         &self,
         deployment: DeploymentLocator,
-        block_cursor: FirehoseCursor,
+        store: impl DeploymentCursorTracker,
         start_blocks: Vec<BlockNumber>,
-        subgraph_current_block: Option<BlockPtr>,
         filter: Arc<Self::TriggerFilter>,
         unified_api_version: UnifiedMappingApiVersion,
     ) -> Result<Box<dyn BlockStream<Self>>, Error> {
@@ -171,24 +165,25 @@ impl Blockchain for Chain {
             .build_firehose(
                 self,
                 deployment,
-                block_cursor,
+                store.firehose_cursor(),
                 start_blocks,
-                subgraph_current_block,
+                store.block_ptr(),
                 filter,
                 unified_api_version,
             )
             .await
     }
 
-    async fn new_polling_block_stream(
+    fn is_refetch_block_required(&self) -> bool {
+        false
+    }
+
+    async fn refetch_firehose_block(
         &self,
-        _deployment: DeploymentLocator,
-        _start_blocks: Vec<BlockNumber>,
-        _subgraph_current_block: Option<BlockPtr>,
-        _filter: Arc<Self::TriggerFilter>,
-        _unified_api_version: UnifiedMappingApiVersion,
-    ) -> Result<Box<dyn BlockStream<Self>>, Error> {
-        panic!("NEAR does not support polling block stream")
+        _logger: &Logger,
+        _cursor: FirehoseCursor,
+    ) -> Result<codec::Block, Error> {
+        unimplemented!("This chain does not support Dynamic Data Sources. is_refetch_block_required always returns false, this shouldn't be called.")
     }
 
     fn chain_store(&self) -> Arc<dyn ChainStore> {
@@ -200,10 +195,7 @@ impl Blockchain for Chain {
         logger: &Logger,
         number: BlockNumber,
     ) -> Result<BlockPtr, IngestorError> {
-        let firehose_endpoint = match self.firehose_endpoints.random() {
-            Some(e) => e.clone(),
-            None => return Err(anyhow::format_err!("no firehose endpoint available").into()),
-        };
+        let firehose_endpoint = self.client.firehose_endpoint()?;
 
         firehose_endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
@@ -212,11 +204,22 @@ impl Blockchain for Chain {
     }
 
     fn runtime_adapter(&self) -> Arc<dyn RuntimeAdapterTrait<Self>> {
-        Arc::new(RuntimeAdapter {})
+        Arc::new(NoopRuntimeAdapter::default())
     }
 
-    fn is_firehose_supported(&self) -> bool {
-        true
+    fn chain_client(&self) -> Arc<ChainClient<Self>> {
+        self.client.clone()
+    }
+
+    fn block_ingestor(&self) -> anyhow::Result<Box<dyn BlockIngestor>> {
+        let ingestor = FirehoseBlockIngestor::<crate::HeaderOnlyBlock, Self>::new(
+            self.chain_store.cheap_clone(),
+            self.chain_client(),
+            self.logger_factory
+                .component_logger("NearFirehoseBlockIngestor", None),
+            self.name.clone(),
+        );
+        Ok(Box::new(ingestor))
     }
 }
 
@@ -235,7 +238,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
 
     async fn triggers_in_block(
         &self,
-        _logger: &Logger,
+        logger: &Logger,
         block: codec::Block,
         filter: &TriggerFilter,
     ) -> Result<BlockWithTriggers<Chain>, Error> {
@@ -292,7 +295,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
             trigger_data.push(NearTrigger::Block(shared_block.cheap_clone()));
         }
 
-        Ok(BlockWithTriggers::new(block, trigger_data))
+        Ok(BlockWithTriggers::new(block, trigger_data, logger))
     }
 
     async fn is_on_main_chain(&self, _ptr: BlockPtr) -> Result<bool, Error> {
@@ -318,9 +321,7 @@ impl TriggersAdapterTrait<Chain> for TriggersAdapter {
     }
 }
 
-pub struct FirehoseMapper {
-    endpoint: Arc<FirehoseEndpoint>,
-}
+pub struct FirehoseMapper {}
 
 #[async_trait]
 impl FirehoseMapperTrait<Chain> for FirehoseMapper {
@@ -371,11 +372,11 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
                 ))
             }
 
-            StepIrreversible => {
+            StepFinal => {
                 panic!("irreversible step is not handled and should not be requested in the Firehose request")
             }
 
-            StepUnknown => {
+            StepUnset => {
                 panic!("unknown step should not happen in the Firehose response")
             }
         }
@@ -384,9 +385,10 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn block_ptr_for_number(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         number: BlockNumber,
     ) -> Result<BlockPtr, Error> {
-        self.endpoint
+        endpoint
             .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, number)
             .await
     }
@@ -394,12 +396,12 @@ impl FirehoseMapperTrait<Chain> for FirehoseMapper {
     async fn final_block_ptr_for(
         &self,
         logger: &Logger,
+        endpoint: &Arc<FirehoseEndpoint>,
         block: &codec::Block,
     ) -> Result<BlockPtr, Error> {
         let final_block_number = block.header().last_final_block_height as BlockNumber;
 
-        self.endpoint
-            .block_ptr_for_number::<codec::HeaderOnlyBlock>(logger, final_block_number)
+        self.block_ptr_for_number(logger, endpoint, final_block_number)
             .await
     }
 }
@@ -569,7 +571,7 @@ mod test {
                 true,
                 case.expected
                     .iter()
-                    .all(|x| receipt.partial_accounts.contains(&x)),
+                    .all(|x| receipt.partial_accounts.contains(x)),
                 "name: {}\npartial_accounts: {:?}",
                 case.name,
                 receipt.partial_accounts,

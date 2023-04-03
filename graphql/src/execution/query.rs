@@ -16,7 +16,8 @@ use graph::data::query::QueryExecutionError;
 use graph::data::query::{Query as GraphDataQuery, QueryVariables};
 use graph::data::schema::ApiSchema;
 use graph::prelude::{
-    info, o, q, r, s, warn, BlockNumber, CheapClone, GraphQLMetrics, Logger, TryFromValue, ENV_VARS,
+    info, o, q, r, s, warn, BlockNumber, CheapClone, DeploymentHash, GraphQLMetrics, Logger,
+    TryFromValue, ENV_VARS,
 };
 
 use crate::execution::ast as a;
@@ -141,8 +142,10 @@ fn validate_query(
     logger: &Logger,
     query: &GraphDataQuery,
     document: &s::Document,
+    metrics: &Arc<dyn GraphQLMetrics>,
+    id: &DeploymentHash,
 ) -> Result<(), Vec<QueryExecutionError>> {
-    let validation_errors = validate(&document, &query.document, &GRAPHQL_VALIDATION_PLAN);
+    let validation_errors = validate(document, &query.document, &GRAPHQL_VALIDATION_PLAN);
 
     if !validation_errors.is_empty() {
         if !ENV_VARS.graphql.silent_graphql_validations {
@@ -163,6 +166,13 @@ fn validate_query(
               "variables" => &query.variables_text,
               "errors" => format!("[{:?}]", validation_errors.iter().map(|e| e.message.clone()).collect::<Vec<_>>().join(", "))
             );
+
+            let error_codes = validation_errors
+                .iter()
+                .map(|e| e.error_code)
+                .collect::<Vec<_>>();
+
+            metrics.observe_query_validation_error(error_codes, id);
         }
     }
 
@@ -183,8 +193,20 @@ impl Query {
         max_depth: u8,
         metrics: Arc<dyn GraphQLMetrics>,
     ) -> Result<Arc<Self>, Vec<QueryExecutionError>> {
+        let query_hash = {
+            let mut hasher = DefaultHasher::new();
+            query.query_text.hash(&mut hasher);
+            query.variables_text.hash(&mut hasher);
+            hasher.finish()
+        };
+        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
+        let logger = logger.new(o!(
+            "subgraph_id" => schema.id().clone(),
+            "query_id" => query_id.clone()
+        ));
+
         let validation_phase_start = Instant::now();
-        validate_query(logger, &query, &schema.document())?;
+        validate_query(&logger, &query, schema.document(), &metrics, schema.id())?;
         metrics.observe_query_validation(validation_phase_start.elapsed(), schema.id());
 
         let mut operation = None;
@@ -218,18 +240,6 @@ impl Query {
                 )])
             }
         };
-
-        let query_hash = {
-            let mut hasher = DefaultHasher::new();
-            query.query_text.hash(&mut hasher);
-            query.variables_text.hash(&mut hasher);
-            hasher.finish()
-        };
-        let query_id = format!("{:x}-{:x}", query.shape_hash, query_hash);
-        let logger = logger.new(o!(
-            "subgraph_id" => schema.id().clone(),
-            "query_id" => query_id.clone()
-        ));
 
         let start = Instant::now();
         let root_type = match kind {
@@ -395,7 +405,7 @@ pub fn coerce_variables(
         if !schema.is_input_type(&variable_def.var_type) {
             errors.push(QueryExecutionError::InvalidVariableTypeError(
                 variable_def.position,
-                variable_def.name.to_owned(),
+                variable_def.name.clone(),
             ));
             continue;
         }
@@ -417,7 +427,7 @@ pub fn coerce_variables(
                 if sast::is_non_null_type(&variable_def.var_type) {
                     errors.push(QueryExecutionError::MissingVariableError(
                         variable_def.position,
-                        variable_def.name.to_owned(),
+                        variable_def.name.clone(),
                     ));
                 };
                 continue;
@@ -428,7 +438,7 @@ pub fn coerce_variables(
         // We have a variable value, attempt to coerce it to the value type
         // of the variable definition
         coerced_values.insert(
-            variable_def.name.to_owned(),
+            variable_def.name.clone(),
             coerce_variable(schema, variable_def, value)?,
         );
     }
@@ -452,7 +462,7 @@ fn coerce_variable(
     coerce_value(value, &variable_def.var_type, &resolver).map_err(|value| {
         vec![QueryExecutionError::InvalidArgumentError(
             variable_def.position,
-            variable_def.name.to_owned(),
+            variable_def.name.clone(),
             value.into(),
         )]
     })
@@ -623,8 +633,7 @@ impl<'s> RawQuery<'s> {
     fn validate_fields(&self) -> Result<(), Vec<QueryExecutionError>> {
         let root_type = self.schema.query_type.as_ref();
 
-        let errors =
-            self.validate_fields_inner(&"Query".to_owned(), root_type.into(), &self.selection_set);
+        let errors = self.validate_fields_inner("Query", root_type.into(), &self.selection_set);
         if errors.is_empty() {
             Ok(())
         } else {
@@ -925,17 +934,15 @@ impl Transform {
                 return Ok(None);
             }
             a::SelectionSet::new(vec![])
+        } else if is_leaf_type {
+            // see: graphql-bug-compat
+            // Field does not allow selections, ignore selections
+            a::SelectionSet::new(vec![])
         } else {
-            if is_leaf_type {
-                // see: graphql-bug-compat
-                // Field does not allow selections, ignore selections
-                a::SelectionSet::new(vec![])
-            } else {
-                let ty = field_type.field_type.get_base_type();
-                let type_set = a::ObjectTypeSet::from_name(&self.schema, ty)?;
-                let ty = self.schema.object_or_interface(ty).unwrap();
-                self.expand_selection_set(selection_set, &type_set, ty)?
-            }
+            let ty = field_type.field_type.get_base_type();
+            let type_set = a::ObjectTypeSet::from_name(&self.schema, ty)?;
+            let ty = self.schema.object_or_interface(ty).unwrap();
+            self.expand_selection_set(selection_set, &type_set, ty)?
         };
 
         Ok(Some(a::Field {

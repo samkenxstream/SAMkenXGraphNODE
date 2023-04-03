@@ -6,7 +6,7 @@ use std::mem::{size_of, size_of_val};
 use anyhow::anyhow;
 use semver::Version;
 
-use graph::runtime::{AscHeap, AscPtr, AscType, AscValue, DeterministicHostError};
+use graph::runtime::{AscHeap, AscPtr, AscType, AscValue, DeterministicHostError, HostExportError};
 use graph_runtime_derive::AscType;
 
 use crate::asc_abi::class;
@@ -87,8 +87,8 @@ impl AscType for ArrayBuffer {
         let mut asc_layout: Vec<u8> = Vec::new();
 
         let byte_length: [u8; 4] = self.byte_length.to_le_bytes();
-        asc_layout.extend(&byte_length);
-        asc_layout.extend(&self.padding);
+        asc_layout.extend(byte_length);
+        asc_layout.extend(self.padding);
         asc_layout.extend(self.content.iter());
 
         // Allocate extra capacity to next power of two, as required by asc.
@@ -116,7 +116,7 @@ impl AscType for ArrayBuffer {
             DeterministicHostError::from(anyhow!("Attempted to read past end of array"))
         })?;
         Ok(ArrayBuffer {
-            byte_length: u32::from_asc_bytes(&byte_length, api_version)?,
+            byte_length: u32::from_asc_bytes(byte_length, api_version)?,
             padding: [0; 4],
             content: content.to_vec().into(),
         })
@@ -153,7 +153,7 @@ impl<T: AscValue> TypedArray<T> {
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<Self, DeterministicHostError> {
+    ) -> Result<Self, HostExportError> {
         let buffer = class::ArrayBuffer::new(content, heap.api_version())?;
         let buffer_byte_length = if let class::ArrayBuffer::ApiVersion0_0_4(ref a) = buffer {
             a.byte_length
@@ -212,7 +212,7 @@ impl AscType for AscString {
         let mut asc_layout: Vec<u8> = Vec::new();
 
         let length: [u8; 4] = self.length.to_le_bytes();
-        asc_layout.extend(&length);
+        asc_layout.extend(length);
 
         // Write the code points, in little-endian (LE) order.
         for &code_unit in self.content.iter() {
@@ -307,7 +307,7 @@ impl<T: AscValue> Array<T> {
         content: &[T],
         heap: &mut H,
         gas: &GasCounter,
-    ) -> Result<Self, DeterministicHostError> {
+    ) -> Result<Self, HostExportError> {
         let arr_buffer = class::ArrayBuffer::new(content, heap.api_version())?;
         let arr_buffer_ptr = AscPtr::alloc_obj(arr_buffer, heap, gas)?;
         Ok(Array {

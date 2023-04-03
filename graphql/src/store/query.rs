@@ -9,7 +9,7 @@ use graph::prelude::*;
 use graph::{components::store::EntityType, data::graphql::ObjectOrInterface};
 
 use crate::execution::ast as a;
-use crate::schema::ast as sast;
+use crate::schema::ast::{self as sast, FilterOp};
 
 use super::prefetch::SelectedAttributes;
 
@@ -53,14 +53,72 @@ pub(crate) fn build_query<'a>(
         query = query.filter(filter);
     }
     let order = match (
-        build_order_by(entity, field)?,
+        build_order_by(entity, field, schema)?,
         build_order_direction(field)?,
     ) {
-        (Some((attr, value_type)), OrderDirection::Ascending) => {
+        (Some((attr, value_type, None)), OrderDirection::Ascending) => {
             EntityOrder::Ascending(attr, value_type)
         }
-        (Some((attr, value_type)), OrderDirection::Descending) => {
+        (Some((attr, value_type, None)), OrderDirection::Descending) => {
             EntityOrder::Descending(attr, value_type)
+        }
+        (Some((attr, _, Some(child))), OrderDirection::Ascending) => {
+            if ENV_VARS.graphql.disable_child_sorting {
+                return Err(QueryExecutionError::NotSupported(
+                    "Sorting by child attributes is not supported".to_string(),
+                ));
+            }
+            match child {
+                OrderByChild::Object(child) => {
+                    EntityOrder::ChildAscending(EntityOrderByChild::Object(
+                        EntityOrderByChildInfo {
+                            sort_by_attribute: attr,
+                            join_attribute: child.join_attribute,
+                            derived: child.derived,
+                        },
+                        child.entity_type,
+                    ))
+                }
+                OrderByChild::Interface(child) => {
+                    EntityOrder::ChildAscending(EntityOrderByChild::Interface(
+                        EntityOrderByChildInfo {
+                            sort_by_attribute: attr,
+                            join_attribute: child.join_attribute,
+                            derived: child.derived,
+                        },
+                        child.entity_types,
+                    ))
+                }
+            }
+        }
+        (Some((attr, _, Some(child))), OrderDirection::Descending) => {
+            if ENV_VARS.graphql.disable_child_sorting {
+                return Err(QueryExecutionError::NotSupported(
+                    "Sorting by child attributes is not supported".to_string(),
+                ));
+            }
+            match child {
+                OrderByChild::Object(child) => {
+                    EntityOrder::ChildDescending(EntityOrderByChild::Object(
+                        EntityOrderByChildInfo {
+                            sort_by_attribute: attr,
+                            join_attribute: child.join_attribute,
+                            derived: child.derived,
+                        },
+                        child.entity_type,
+                    ))
+                }
+                OrderByChild::Interface(child) => {
+                    EntityOrder::ChildDescending(EntityOrderByChild::Interface(
+                        EntityOrderByChildInfo {
+                            sort_by_attribute: attr,
+                            join_attribute: child.join_attribute,
+                            derived: child.derived,
+                        },
+                        child.entity_types,
+                    ))
+                }
+            }
         }
         (None, _) => EntityOrder::Default,
     };
@@ -116,18 +174,25 @@ fn build_filter(
     field: &a::Field,
     schema: &ApiSchema,
 ) -> Result<Option<EntityFilter>, QueryExecutionError> {
-    match field.argument_value("where") {
+    let where_filter = match field.argument_value("where") {
         Some(r::Value::Object(object)) => match build_filter_from_object(entity, object, schema) {
-            Ok(filter) => Ok(Some(filter)),
+            Ok(filter) => Ok(Some(EntityFilter::And(filter))),
             Err(e) => Err(e),
         },
-        Some(r::Value::Null) => Ok(None),
-        None => match field.argument_value("text") {
-            Some(r::Value::Object(filter)) => build_fulltext_filter_from_object(filter),
-            None => Ok(None),
-            _ => Err(QueryExecutionError::InvalidFilterError),
-        },
+        Some(r::Value::Null) | None => Ok(None),
         _ => Err(QueryExecutionError::InvalidFilterError),
+    }?;
+
+    let text_filter = match field.argument_value("text") {
+        Some(r::Value::Object(filter)) => build_fulltext_filter_from_object(filter),
+        None => Ok(None),
+        _ => Err(QueryExecutionError::InvalidFilterError),
+    }?;
+
+    match (where_filter, text_filter) {
+        (None, None) => Ok(None),
+        (Some(f), None) | (None, Some(f)) => Ok(Some(f)),
+        (Some(w), Some(t)) => Ok(Some(EntityFilter::And(vec![t, w]))),
     }
 }
 
@@ -138,7 +203,7 @@ fn build_fulltext_filter_from_object(
         Err(QueryExecutionError::FulltextQueryRequiresFilter),
         |(key, value)| {
             if let r::Value::String(s) = value {
-                Ok(Some(EntityFilter::Equal(
+                Ok(Some(EntityFilter::Fulltext(
                     key.to_string(),
                     Value::String(s.clone()),
                 )))
@@ -154,11 +219,93 @@ fn parse_change_block_filter(value: &r::Value) -> Result<BlockNumber, QueryExecu
         r::Value::Object(object) => i32::try_from_value(
             object
                 .get("number_gte")
-                .ok_or_else(|| QueryExecutionError::InvalidFilterError)?,
+                .ok_or(QueryExecutionError::InvalidFilterError)?,
         )
         .map_err(|_| QueryExecutionError::InvalidFilterError),
         _ => Err(QueryExecutionError::InvalidFilterError),
     }
+}
+
+/// Parses a GraphQL Filter Value into an EntityFilter.
+fn build_entity_filter(
+    field_name: String,
+    operation: FilterOp,
+    store_value: Value,
+) -> Result<EntityFilter, QueryExecutionError> {
+    match operation {
+        FilterOp::Not => Ok(EntityFilter::Not(field_name, store_value)),
+        FilterOp::GreaterThan => Ok(EntityFilter::GreaterThan(field_name, store_value)),
+        FilterOp::LessThan => Ok(EntityFilter::LessThan(field_name, store_value)),
+        FilterOp::GreaterOrEqual => Ok(EntityFilter::GreaterOrEqual(field_name, store_value)),
+        FilterOp::LessOrEqual => Ok(EntityFilter::LessOrEqual(field_name, store_value)),
+        FilterOp::In => Ok(EntityFilter::In(
+            field_name,
+            list_values(store_value, "_in")?,
+        )),
+        FilterOp::NotIn => Ok(EntityFilter::NotIn(
+            field_name,
+            list_values(store_value, "_not_in")?,
+        )),
+        FilterOp::Contains => Ok(EntityFilter::Contains(field_name, store_value)),
+        FilterOp::ContainsNoCase => Ok(EntityFilter::ContainsNoCase(field_name, store_value)),
+        FilterOp::NotContains => Ok(EntityFilter::NotContains(field_name, store_value)),
+        FilterOp::NotContainsNoCase => Ok(EntityFilter::NotContainsNoCase(field_name, store_value)),
+        FilterOp::StartsWith => Ok(EntityFilter::StartsWith(field_name, store_value)),
+        FilterOp::StartsWithNoCase => Ok(EntityFilter::StartsWithNoCase(field_name, store_value)),
+        FilterOp::NotStartsWith => Ok(EntityFilter::NotStartsWith(field_name, store_value)),
+        FilterOp::NotStartsWithNoCase => {
+            Ok(EntityFilter::NotStartsWithNoCase(field_name, store_value))
+        }
+        FilterOp::EndsWith => Ok(EntityFilter::EndsWith(field_name, store_value)),
+        FilterOp::EndsWithNoCase => Ok(EntityFilter::EndsWithNoCase(field_name, store_value)),
+        FilterOp::NotEndsWith => Ok(EntityFilter::NotEndsWith(field_name, store_value)),
+        FilterOp::NotEndsWithNoCase => Ok(EntityFilter::NotEndsWithNoCase(field_name, store_value)),
+        FilterOp::Equal => Ok(EntityFilter::Equal(field_name, store_value)),
+        _ => unreachable!(),
+    }
+}
+
+/// Iterate over the list and generate an EntityFilter from it
+fn build_list_filter_from_value(
+    entity: ObjectOrInterface,
+    schema: &ApiSchema,
+    value: &r::Value,
+) -> Result<Vec<EntityFilter>, QueryExecutionError> {
+    // We have object like this
+    // { or: [{ name: \"John\", id: \"m1\" }, { mainBand: \"b2\" }] }
+    match value {
+        r::Value::List(list) => Ok(list
+            .iter()
+            .map(|item| {
+                // It is each filter in the object
+                // { name: \"John\", id: \"m1\" }
+                // the fields within the object are ANDed together
+                match item {
+                    r::Value::Object(object) => Ok(EntityFilter::And(build_filter_from_object(
+                        entity, object, schema,
+                    )?)),
+                    _ => Err(QueryExecutionError::InvalidFilterError),
+                }
+            })
+            .collect::<Result<Vec<EntityFilter>, QueryExecutionError>>()?),
+        _ => Err(QueryExecutionError::InvalidFilterError),
+    }
+}
+
+/// build a filter which has list of nested filters
+fn build_list_filter_from_object(
+    entity: ObjectOrInterface,
+    object: &Object,
+    schema: &ApiSchema,
+) -> Result<Vec<EntityFilter>, QueryExecutionError> {
+    Ok(object
+        .iter()
+        .map(|(_, value)| build_list_filter_from_value(entity, schema, value))
+        .collect::<Result<Vec<Vec<EntityFilter>>, QueryExecutionError>>()?
+        .into_iter()
+        // We iterate an object so all entity filters are flattened into one list
+        .flatten()
+        .collect::<Vec<EntityFilter>>())
 }
 
 /// Parses a GraphQL input object into an EntityFilter, if present.
@@ -166,86 +313,76 @@ fn build_filter_from_object(
     entity: ObjectOrInterface,
     object: &Object,
     schema: &ApiSchema,
-) -> Result<EntityFilter, QueryExecutionError> {
-    Ok(EntityFilter::And({
-        object
-            .iter()
-            .map(|(key, value)| {
-                // Special handling for _change_block input filter since its not a
-                // standard entity filter that is based on entity structure/fields
-                if key == "_change_block" {
-                    return match parse_change_block_filter(value) {
-                        Ok(block_number) => Ok(EntityFilter::ChangeBlockGte(block_number)),
-                        Err(e) => Err(e),
-                    };
-                }
+) -> Result<Vec<EntityFilter>, QueryExecutionError> {
+    object
+        .iter()
+        .map(|(key, value)| {
+            // Special handling for _change_block input filter since its not a
+            // standard entity filter that is based on entity structure/fields
+            if key == "_change_block" {
+                return match parse_change_block_filter(value) {
+                    Ok(block_number) => Ok(EntityFilter::ChangeBlockGte(block_number)),
+                    Err(e) => Err(e),
+                };
+            }
+            use self::sast::FilterOp::*;
+            let (field_name, op) = sast::parse_field_as_filter(key);
 
-                use self::sast::FilterOp::*;
-                let (field_name, op) = sast::parse_field_as_filter(key);
-
-                let field = sast::get_field(entity, &field_name).ok_or_else(|| {
-                    QueryExecutionError::EntityFieldError(
-                        entity.name().to_owned(),
-                        field_name.clone(),
-                    )
-                })?;
-
-                let ty = &field.field_type;
-
-                Ok(match op {
-                    Child => match value {
-                        DataValue::Object(obj) => {
-                            build_child_filter_from_object(entity, field_name, obj, schema)?
-                        }
-                        _ => {
-                            return Err(QueryExecutionError::AttributeTypeError(
-                                value.to_string(),
-                                ty.to_string(),
-                            ))
-                        }
-                    },
-                    _ => {
-                        let store_value = Value::from_query_value(value, ty)?;
-
-                        match op {
-                            Not => EntityFilter::Not(field_name, store_value),
-                            GreaterThan => EntityFilter::GreaterThan(field_name, store_value),
-                            LessThan => EntityFilter::LessThan(field_name, store_value),
-                            GreaterOrEqual => EntityFilter::GreaterOrEqual(field_name, store_value),
-                            LessOrEqual => EntityFilter::LessOrEqual(field_name, store_value),
-                            In => EntityFilter::In(field_name, list_values(store_value, "_in")?),
-                            NotIn => EntityFilter::NotIn(
-                                field_name,
-                                list_values(store_value, "_not_in")?,
-                            ),
-                            Contains => EntityFilter::Contains(field_name, store_value),
-                            ContainsNoCase => EntityFilter::ContainsNoCase(field_name, store_value),
-                            NotContains => EntityFilter::NotContains(field_name, store_value),
-                            NotContainsNoCase => {
-                                EntityFilter::NotContainsNoCase(field_name, store_value)
-                            }
-                            StartsWith => EntityFilter::StartsWith(field_name, store_value),
-                            StartsWithNoCase => {
-                                EntityFilter::StartsWithNoCase(field_name, store_value)
-                            }
-                            NotStartsWith => EntityFilter::NotStartsWith(field_name, store_value),
-                            NotStartsWithNoCase => {
-                                EntityFilter::NotStartsWithNoCase(field_name, store_value)
-                            }
-                            EndsWith => EntityFilter::EndsWith(field_name, store_value),
-                            EndsWithNoCase => EntityFilter::EndsWithNoCase(field_name, store_value),
-                            NotEndsWith => EntityFilter::NotEndsWith(field_name, store_value),
-                            NotEndsWithNoCase => {
-                                EntityFilter::NotEndsWithNoCase(field_name, store_value)
-                            }
-                            Equal => EntityFilter::Equal(field_name, store_value),
-                            _ => unreachable!(),
-                        }
+            Ok(match op {
+                And => {
+                    if ENV_VARS.graphql.disable_bool_filters {
+                        return Err(QueryExecutionError::NotSupported(
+                            "Boolean filters are not supported".to_string(),
+                        ));
                     }
-                })
+
+                    return Ok(EntityFilter::And(build_list_filter_from_object(
+                        entity, object, schema,
+                    )?));
+                }
+                Or => {
+                    if ENV_VARS.graphql.disable_bool_filters {
+                        return Err(QueryExecutionError::NotSupported(
+                            "Boolean filters are not supported".to_string(),
+                        ));
+                    }
+
+                    return Ok(EntityFilter::Or(build_list_filter_from_object(
+                        entity, object, schema,
+                    )?));
+                }
+                Child => match value {
+                    DataValue::Object(obj) => {
+                        build_child_filter_from_object(entity, field_name, obj, schema)?
+                    }
+                    _ => {
+                        let field = sast::get_field(entity, &field_name).ok_or_else(|| {
+                            QueryExecutionError::EntityFieldError(
+                                entity.name().to_owned(),
+                                field_name.clone(),
+                            )
+                        })?;
+                        let ty = &field.field_type;
+                        return Err(QueryExecutionError::AttributeTypeError(
+                            value.to_string(),
+                            ty.to_string(),
+                        ));
+                    }
+                },
+                _ => {
+                    let field = sast::get_field(entity, &field_name).ok_or_else(|| {
+                        QueryExecutionError::EntityFieldError(
+                            entity.name().to_owned(),
+                            field_name.clone(),
+                        )
+                    })?;
+                    let ty = &field.field_type;
+                    let store_value = Value::from_query_value(value, ty)?;
+                    return build_entity_filter(field_name, op, store_value);
+                }
             })
-            .collect::<Result<Vec<EntityFilter>, QueryExecutionError>>()?
-    }))
+        })
+        .collect::<Result<Vec<EntityFilter>, QueryExecutionError>>()
 }
 
 fn build_child_filter_from_object(
@@ -261,7 +398,11 @@ fn build_child_filter_from_object(
     let child_entity = schema
         .object_or_interface(type_name)
         .ok_or(QueryExecutionError::InvalidFilterError)?;
-    let filter = Box::new(build_filter_from_object(child_entity, object, schema)?);
+    let filter = Box::new(EntityFilter::And(build_filter_from_object(
+        child_entity,
+        object,
+        schema,
+    )?));
     let derived = field.is_derived();
     let attr = match derived {
         true => sast::get_derived_from_field(child_entity, field)
@@ -314,7 +455,7 @@ fn build_child_filter_from_object(
                     };
 
                     Ok(EntityFilter::Child(Child {
-                        attr: attr.clone(),
+                        attr,
                         entity_type: EntityType::new(child_entity.name().to_string()),
                         filter: filter.clone(),
                         derived,
@@ -360,27 +501,146 @@ fn list_values(value: Value, filter_type: &str) -> Result<Vec<Value>, QueryExecu
     }
 }
 
+enum OrderByValue {
+    Direct(String),
+    Child(String, String),
+}
+
+fn parse_order_by(enum_value: &String) -> Result<OrderByValue, QueryExecutionError> {
+    let mut parts = enum_value.split("__");
+    let first = parts.next().ok_or_else(|| {
+        QueryExecutionError::ValueParseError(
+            "Invalid order value".to_string(),
+            enum_value.to_string(),
+        )
+    })?;
+    let second = parts.next();
+
+    Ok(match second {
+        Some(second) => OrderByValue::Child(first.to_string(), second.to_string()),
+        None => OrderByValue::Direct(first.to_string()),
+    })
+}
+
+struct ObjectOrderDetails {
+    entity_type: EntityType,
+    join_attribute: Attribute,
+    derived: bool,
+}
+
+struct InterfaceOrderDetails {
+    entity_types: Vec<EntityType>,
+    join_attribute: Attribute,
+    derived: bool,
+}
+
+enum OrderByChild {
+    Object(ObjectOrderDetails),
+    Interface(InterfaceOrderDetails),
+}
+
 /// Parses GraphQL arguments into an field name to order by, if present.
 fn build_order_by(
     entity: ObjectOrInterface,
     field: &a::Field,
-) -> Result<Option<(String, ValueType)>, QueryExecutionError> {
+    schema: &ApiSchema,
+) -> Result<Option<(String, ValueType, Option<OrderByChild>)>, QueryExecutionError> {
     match field.argument_value("orderBy") {
-        Some(r::Value::Enum(name)) => {
-            let field = sast::get_field(entity, name).ok_or_else(|| {
-                QueryExecutionError::EntityFieldError(entity.name().to_owned(), name.clone())
-            })?;
-            sast::get_field_value_type(&field.field_type)
-                .map(|value_type| Some((name.to_owned(), value_type)))
-                .map_err(|_| {
-                    QueryExecutionError::OrderByNotSupportedError(
+        Some(r::Value::Enum(name)) => match parse_order_by(name)? {
+            OrderByValue::Direct(name) => {
+                let field = sast::get_field(entity, name.as_str()).ok_or_else(|| {
+                    QueryExecutionError::EntityFieldError(entity.name().to_owned(), name.clone())
+                })?;
+                sast::get_field_value_type(&field.field_type)
+                    .map(|value_type| Some((name.clone(), value_type, None)))
+                    .map_err(|_| {
+                        QueryExecutionError::OrderByNotSupportedError(
+                            entity.name().to_owned(),
+                            name.clone(),
+                        )
+                    })
+            }
+            OrderByValue::Child(parent_field_name, child_field_name) => {
+                if entity.is_interface() {
+                    return Err(QueryExecutionError::OrderByNotSupportedError(
                         entity.name().to_owned(),
-                        name.clone(),
-                    )
-                })
-        }
+                        parent_field_name,
+                    ));
+                }
+
+                let field =
+                    sast::get_field(entity, parent_field_name.as_str()).ok_or_else(|| {
+                        QueryExecutionError::EntityFieldError(
+                            entity.name().to_owned(),
+                            parent_field_name.clone(),
+                        )
+                    })?;
+                let derived = field.is_derived();
+                let base_type = field.field_type.get_base_type();
+                let child_entity = schema
+                    .object_or_interface(base_type)
+                    .ok_or_else(|| QueryExecutionError::NamedTypeError(base_type.into()))?;
+                let child_field = sast::get_field(child_entity, child_field_name.as_str())
+                    .ok_or_else(|| {
+                        QueryExecutionError::EntityFieldError(
+                            child_entity.name().to_owned(),
+                            child_field_name.clone(),
+                        )
+                    })?;
+
+                let join_attribute = match derived {
+                    true => sast::get_derived_from_field(child_entity, field)
+                        .ok_or_else(|| {
+                            QueryExecutionError::EntityFieldError(
+                                entity.name().to_string(),
+                                field.name.to_string(),
+                            )
+                        })?
+                        .name
+                        .to_string(),
+                    false => parent_field_name,
+                };
+
+                let child = match child_entity {
+                    ObjectOrInterface::Object(_) => OrderByChild::Object(ObjectOrderDetails {
+                        entity_type: EntityType::new(base_type.into()),
+                        join_attribute,
+                        derived,
+                    }),
+                    ObjectOrInterface::Interface(interface) => {
+                        let entity_types = schema
+                            .types_for_interface()
+                            .get(&EntityType::new(interface.name.to_string()))
+                            .map(|object_types| {
+                                object_types
+                                    .iter()
+                                    .map(|object_type| EntityType::new(object_type.name.clone()))
+                                    .collect::<Vec<EntityType>>()
+                            })
+                            .ok_or(QueryExecutionError::AbstractTypeError(
+                                "Interface not implemented by any object type".to_string(),
+                            ))?;
+                        OrderByChild::Interface(InterfaceOrderDetails {
+                            entity_types,
+                            join_attribute,
+                            derived,
+                        })
+                    }
+                };
+
+                sast::get_field_value_type(&child_field.field_type)
+                    .map(|value_type| Some((child_field_name.clone(), value_type, Some(child))))
+                    .map_err(|_| {
+                        QueryExecutionError::OrderByNotSupportedError(
+                            child_entity.name().to_owned(),
+                            child_field_name.clone(),
+                        )
+                    })
+            }
+        },
         _ => match field.argument_value("text") {
-            Some(r::Value::Object(filter)) => build_fulltext_order_by_from_object(filter),
+            Some(r::Value::Object(filter)) => build_fulltext_order_by_from_object(filter)
+                .map(|order_by| order_by.map(|(attr, value)| (attr, value, None))),
             None => Ok(None),
             _ => Err(QueryExecutionError::InvalidFilterError),
         },
@@ -462,7 +722,7 @@ pub(crate) fn collect_entities_from_query_field(
                         // Obtain the subgraph ID from the object type
                         if let Ok(subgraph_id) = parse_subgraph_id(object_type) {
                             // Add the (subgraph_id, entity_name) tuple to the result set
-                            entities.insert((subgraph_id, object_type.name.to_owned()));
+                            entities.insert((subgraph_id, object_type.name.clone()));
                         }
                     }
 

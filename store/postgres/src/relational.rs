@@ -14,8 +14,13 @@ mod ddl_tests;
 #[cfg(test)]
 mod query_tests;
 
+pub(crate) mod index;
 mod prune;
 
+use diesel::pg::Pg;
+use diesel::serialize::Output;
+use diesel::sql_types::Text;
+use diesel::types::{FromSql, ToSql};
 use diesel::{connection::SimpleConnection, Connection};
 use diesel::{debug_query, OptionalExtension, PgConnection, RunQueryDsl};
 use graph::cheap_clone::CheapClone;
@@ -23,11 +28,12 @@ use graph::constraint_violation;
 use graph::data::graphql::TypeExt as _;
 use graph::data::query::Trace;
 use graph::data::value::Word;
-use graph::prelude::{q, s, StopwatchMetrics, ENV_VARS};
+use graph::data_source::CausalityRegion;
+use graph::prelude::{q, s, EntityQuery, StopwatchMetrics, ENV_VARS};
 use graph::slog::warn;
 use inflector::Inflector;
 use lazy_static::lazy_static;
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::{From, TryFrom};
 use std::fmt::{self, Write};
@@ -35,7 +41,7 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::relational_queries::{FindChangesQuery, FindPossibleDeletionsQuery};
+use crate::relational_queries::{FindChangesQuery, FindDerivedQuery, FindPossibleDeletionsQuery};
 use crate::{
     primary::{Namespace, Site},
     relational_queries::{
@@ -43,15 +49,14 @@ use crate::{
         FilterQuery, FindManyQuery, FindQuery, InsertQuery, RevertClampQuery, RevertRemoveQuery,
     },
 };
-use graph::components::store::{EntityKey, EntityType};
+use graph::components::store::{DerivedEntityQuery, EntityKey, EntityType};
 use graph::data::graphql::ext::{DirectiveFinder, DocumentExt, ObjectTypeExt};
 use graph::data::schema::{FulltextConfig, FulltextDefinition, Schema, SCHEMA_TYPE_NAME};
 use graph::data::store::BYTES_SCALAR;
 use graph::data::subgraph::schema::{POI_OBJECT, POI_TABLE};
 use graph::prelude::{
-    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityCollection,
-    EntityFilter, EntityOperation, EntityOrder, EntityRange, Logger, QueryExecutionError,
-    StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
+    anyhow, info, BlockNumber, DeploymentHash, Entity, EntityChange, EntityOperation, Logger,
+    QueryExecutionError, StoreError, StoreEvent, ValueType, BLOCK_NUMBER_MAX,
 };
 
 use crate::block_range::{BLOCK_COLUMN, BLOCK_RANGE_COLUMN};
@@ -59,7 +64,6 @@ pub use crate::catalog::Catalog;
 use crate::connection_pool::ForeignServer;
 use crate::{catalog, deployment};
 
-const POSTGRES_MAX_PARAMETERS: usize = u16::MAX as usize; // 65535
 const DELETE_OPERATION_CHUNK_SIZE: usize = 1_000;
 
 /// The size of string prefixes that we index. This is chosen so that we
@@ -90,7 +94,7 @@ lazy_static! {
 /// Postgres, we would create the same table twice. We consider this case
 /// to be pathological and so unlikely in practice that we do not try to work
 /// around it in the application.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Hash, Ord)]
 pub struct SqlName(String);
 
 impl SqlName {
@@ -162,6 +166,24 @@ impl fmt::Display for SqlName {
     }
 }
 
+impl Borrow<str> for &SqlName {
+    fn borrow(&self) -> &str {
+        self.as_str()
+    }
+}
+
+impl FromSql<Text, Pg> for SqlName {
+    fn from_sql(bytes: Option<&[u8]>) -> diesel::deserialize::Result<Self> {
+        <String as FromSql<Text, Pg>>::from_sql(bytes).map(|s| SqlName::verbatim(s))
+    }
+}
+
+impl ToSql<Text, Pg> for SqlName {
+    fn to_sql<W: std::io::Write>(&self, out: &mut Output<W, Pg>) -> diesel::serialize::Result {
+        <String as ToSql<Text, Pg>>::to_sql(&self.0, out)
+    }
+}
+
 /// The SQL type to use for GraphQL ID properties. We support
 /// strings and byte arrays
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Hash)]
@@ -184,7 +206,7 @@ impl TryFrom<&s::ObjectType> for IdType {
 
     fn try_from(obj_type: &s::ObjectType) -> Result<Self, Self::Error> {
         let pk = obj_type
-            .field(&PRIMARY_KEY_COLUMN.to_owned())
+            .field(PRIMARY_KEY_COLUMN)
             .expect("Each ObjectType has an `id` field");
         Self::try_from(&pk.field_type)
     }
@@ -225,6 +247,8 @@ pub struct Layout {
     pub enums: EnumMap,
     /// The query to count all entities
     pub count_query: String,
+    /// How many blocks of history the subgraph should keep
+    pub history_blocks: BlockNumber,
 }
 
 impl Layout {
@@ -246,7 +270,7 @@ impl Layout {
                             enum_type
                                 .values
                                 .iter()
-                                .map(|value| value.name.to_owned())
+                                .map(|value| value.name.clone())
                                 .collect::<BTreeSet<_>>(),
                         ),
                     ))
@@ -282,7 +306,7 @@ impl Layout {
                         // they have a String `id` field
                         // see also: id-type-for-unimplemented-interfaces
                         let id_type = types.iter().next().cloned().unwrap_or(IdType::String);
-                        Ok((interface.to_owned(), id_type))
+                        Ok((interface.clone(), id_type))
                     }
                 })
         });
@@ -308,6 +332,9 @@ impl Layout {
                     &enums,
                     &id_types,
                     i as u32,
+                    catalog
+                        .entities_with_causality_region
+                        .contains(&EntityType::from(*obj_type)),
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -349,6 +376,7 @@ impl Layout {
             tables,
             enums,
             count_query,
+            history_blocks: i32::MAX,
         })
     }
 
@@ -388,6 +416,7 @@ impl Layout {
             position: position as u32,
             is_account_like: false,
             immutable: false,
+            has_causality_region: false,
         }
     }
 
@@ -399,8 +428,9 @@ impl Layout {
         conn: &PgConnection,
         site: Arc<Site>,
         schema: &Schema,
+        entities_with_causality_region: BTreeSet<EntityType>,
     ) -> Result<Layout, StoreError> {
-        let catalog = Catalog::for_creation(site.cheap_clone());
+        let catalog = Catalog::for_creation(site.cheap_clone(), entities_with_causality_region);
         let layout = Self::new(site, schema, catalog)?;
         let sql = layout
             .as_ddl()
@@ -421,8 +451,7 @@ impl Layout {
         self.tables
             .values()
             .filter_map(|dst| base.table(&dst.name).map(|src| (dst, src)))
-            .map(|(dst, src)| dst.can_copy_from(src))
-            .flatten()
+            .flat_map(|(dst, src)| dst.can_copy_from(src))
             .collect()
     }
 
@@ -479,31 +508,31 @@ impl Layout {
     pub fn find(
         &self,
         conn: &PgConnection,
-        entity: &EntityType,
-        id: &str,
+        key: &EntityKey,
         block: BlockNumber,
     ) -> Result<Option<Entity>, StoreError> {
-        let table = self.table_for_entity(entity)?;
-        FindQuery::new(table.as_ref(), id, block)
+        let table = self.table_for_entity(&key.entity_type)?;
+        FindQuery::new(table.as_ref(), key, block)
             .get_result::<EntityData>(conn)
             .optional()?
             .map(|entity_data| entity_data.deserialize_with_layout(self, None, true))
             .transpose()
     }
 
+    // An optimization when looking up multiple entities, it will generate a single sql query using `UNION ALL`.
     pub fn find_many(
         &self,
         conn: &PgConnection,
-        ids_for_type: &BTreeMap<&EntityType, Vec<&str>>,
+        ids_for_type: &BTreeMap<(EntityType, CausalityRegion), Vec<String>>,
         block: BlockNumber,
-    ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
         if ids_for_type.is_empty() {
             return Ok(BTreeMap::new());
         }
 
         let mut tables = Vec::new();
-        for entity_type in ids_for_type.keys() {
-            tables.push(self.table_for_entity(entity_type)?.as_ref());
+        for (entity_type, cr) in ids_for_type.keys() {
+            tables.push((self.table_for_entity(entity_type)?.as_ref(), *cr));
         }
         let query = FindManyQuery {
             _namespace: &self.catalog.site.namespace,
@@ -511,17 +540,48 @@ impl Layout {
             tables,
             block,
         };
-        let mut entities_for_type: BTreeMap<EntityType, Vec<Entity>> = BTreeMap::new();
+        let mut entities: BTreeMap<EntityKey, Entity> = BTreeMap::new();
         for data in query.load::<EntityData>(conn)? {
             let entity_type = data.entity_type();
             let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
 
-            entities_for_type
-                .entry(entity_type)
-                .or_default()
-                .push(entity_data);
+            let key = EntityKey {
+                entity_type,
+                entity_id: entity_data.id()?.into(),
+                causality_region: CausalityRegion::from_entity(&entity_data),
+            };
+            let overwrite = entities.insert(key, entity_data).is_some();
+            if overwrite {
+                return Err(constraint_violation!("duplicate entity in result set"));
+            }
         }
-        Ok(entities_for_type)
+        Ok(entities)
+    }
+
+    pub fn find_derived(
+        &self,
+        conn: &PgConnection,
+        derived_query: &DerivedEntityQuery,
+        block: BlockNumber,
+        excluded_keys: &Vec<EntityKey>,
+    ) -> Result<BTreeMap<EntityKey, Entity>, StoreError> {
+        let table = self.table_for_entity(&derived_query.entity_type)?;
+        let query = FindDerivedQuery::new(table, derived_query, block, excluded_keys);
+
+        let mut entities = BTreeMap::new();
+
+        for data in query.load::<EntityData>(conn)? {
+            let entity_type = data.entity_type();
+            let entity_data: Entity = data.deserialize_with_layout(self, None, true)?;
+            let key = EntityKey {
+                entity_type,
+                entity_id: entity_data.id()?.into(),
+                causality_region: CausalityRegion::from_entity(&entity_data),
+            };
+
+            entities.insert(key, entity_data);
+        }
+        Ok(entities)
     }
 
     pub fn find_changes(
@@ -548,18 +608,15 @@ impl Layout {
 
         for entity_data in inserts_or_updates.into_iter() {
             let entity_type = entity_data.entity_type();
-            let mut data: Entity = entity_data.deserialize_with_layout(self, None, false)?;
+            let data: Entity = entity_data.deserialize_with_layout(self, None, true)?;
             let entity_id = Word::from(data.id().expect("Invalid ID for entity."));
             processed_entities.insert((entity_type.clone(), entity_id.clone()));
-
-            // `__typename` is not a real field.
-            data.remove("__typename")
-                .expect("__typename expected; this is a bug");
 
             changes.push(EntityOperation::Set {
                 key: EntityKey {
                     entity_type,
                     entity_id,
+                    causality_region: CausalityRegion::from_entity(&data),
                 },
                 data,
             });
@@ -576,6 +633,7 @@ impl Layout {
                     key: EntityKey {
                         entity_type,
                         entity_id,
+                        causality_region: del.causality_region(),
                     },
                 });
             }
@@ -595,11 +653,10 @@ impl Layout {
         let table = self.table_for_entity(entity_type)?;
         let _section = stopwatch.start_section("insert_modification_insert_query");
         let mut count = 0;
-        // Each operation must respect the maximum number of bindings allowed in PostgreSQL queries,
-        // so we need to act in chunks whose size is defined by the number of entities times the
-        // number of attributes each entity type has.
-        // We add 1 to account for the `block_range` bind parameter
-        let chunk_size = POSTGRES_MAX_PARAMETERS / (table.columns.len() + 1);
+
+        // We insert the entities in chunks to make sure each operation does
+        // not exceed the maximum number of bindings allowed in queries
+        let chunk_size = InsertQuery::chunk_size(table);
         for chunk in entities.chunks_mut(chunk_size) {
             count += InsertQuery::new(table, chunk, block)?
                 .get_results(conn)
@@ -625,55 +682,64 @@ impl Layout {
         &self,
         logger: &Logger,
         conn: &PgConnection,
-        collection: EntityCollection,
-        filter: Option<EntityFilter>,
-        order: EntityOrder,
-        range: EntityRange,
-        block: BlockNumber,
-        query_id: Option<String>,
+        query: EntityQuery,
     ) -> Result<(Vec<T>, Trace), QueryExecutionError> {
         fn log_query_timing(
             logger: &Logger,
             query: &FilterQuery,
             elapsed: Duration,
             entity_count: usize,
+            trace: bool,
         ) -> Trace {
             // 20kB
             const MAXLEN: usize = 20_480;
 
-            if !ENV_VARS.log_sql_timing() {
+            if !ENV_VARS.log_sql_timing() && !trace {
                 return Trace::None;
             }
 
-            let mut text = debug_query(&query).to_string().replace("\n", "\t");
-            let trace = Trace::query(&text, elapsed, entity_count);
+            let mut text = debug_query(&query).to_string().replace('\n', "\t");
 
-            // If the query + bind variables is more than MAXLEN, truncate it;
-            // this will happen when queries have very large bind variables
-            // (e.g., long arrays of string ids)
-            if text.len() > MAXLEN {
-                text.truncate(MAXLEN);
-                text.push_str(" ...");
+            let trace = if trace {
+                Trace::query(&text, elapsed, entity_count)
+            } else {
+                Trace::None
+            };
+
+            if ENV_VARS.log_sql_timing() {
+                // If the query + bind variables is more than MAXLEN, truncate it;
+                // this will happen when queries have very large bind variables
+                // (e.g., long arrays of string ids)
+                if text.len() > MAXLEN {
+                    text.truncate(MAXLEN);
+                    text.push_str(" ...");
+                }
+                info!(
+                    logger,
+                    "Query timing (SQL)";
+                    "query" => text,
+                    "time_ms" => elapsed.as_millis(),
+                    "entity_count" => entity_count
+                );
             }
-            info!(
-                logger,
-                "Query timing (SQL)";
-                "query" => text,
-                "time_ms" => elapsed.as_millis(),
-                "entity_count" => entity_count
-            );
             trace
         }
 
-        let filter_collection = FilterCollection::new(self, collection, filter.as_ref(), block)?;
+        let trace = query.trace;
+
+        let filter_collection =
+            FilterCollection::new(self, query.collection, query.filter.as_ref(), query.block)?;
         let query = FilterQuery::new(
             &filter_collection,
-            filter.as_ref(),
-            order,
-            range,
-            block,
-            query_id,
+            self,
+            query.filter.as_ref(),
+            query.order,
+            query.range,
+            query.block,
+            query.query_id,
+            &self.site,
         )?;
+
         let query_clone = query.clone();
 
         let start = Instant::now();
@@ -710,7 +776,7 @@ impl Layout {
                     )),
                 }
             })?;
-        let trace = log_query_timing(logger, &query_clone, start.elapsed(), values.len());
+        let trace = log_query_timing(logger, &query_clone, start.elapsed(), values.len(), trace);
 
         let parent_type = filter_collection.parent_type()?.map(ColumnType::from);
         values
@@ -735,7 +801,7 @@ impl Layout {
         let table = self.table_for_entity(entity_type)?;
         if table.immutable {
             let ids = entities
-                .into_iter()
+                .iter_mut()
                 .map(|(key, _)| key.entity_id.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -758,11 +824,9 @@ impl Layout {
         let _section = stopwatch.start_section("update_modification_insert_query");
         let mut count = 0;
 
-        // Each operation must respect the maximum number of bindings allowed in PostgreSQL queries,
-        // so we need to act in chunks whose size is defined by the number of entities times the
-        // number of attributes each entity type has.
-        // We add 1 to account for the `block_range` bind parameter
-        let chunk_size = POSTGRES_MAX_PARAMETERS / (table.columns.len() + 1);
+        // We insert the entities in chunks to make sure each operation does
+        // not exceed the maximum number of bindings allowed in queries
+        let chunk_size = InsertQuery::chunk_size(table);
         for chunk in entities.chunks_mut(chunk_size) {
             count += InsertQuery::new(table, chunk, block)?.execute(conn)?;
         }
@@ -875,15 +939,22 @@ impl Layout {
         true
     }
 
-    /// Update the layout with the latest information from the database; for
-    /// now, an update only changes the `is_account_like` flag for tables or
-    /// the layout's site. If no update is needed, just return `self`.
-    pub fn refresh(
+    /// Update the layout with the latest information from the database; an
+    /// update can only change the `is_account_like` flag for tables, the
+    /// layout's site, or the `history_blocks`. If no update is needed, just
+    /// return `self`.
+    ///
+    /// This is tied closely to how the `LayoutCache` works and called from
+    /// it right after creating a `Layout`, and periodically to update the
+    /// `Layout` in case changes were made
+    fn refresh(
         self: Arc<Self>,
         conn: &PgConnection,
         site: Arc<Site>,
     ) -> Result<Arc<Self>, StoreError> {
         let account_like = crate::catalog::account_like(conn, &self.site)?;
+        let history_blocks = deployment::history_blocks(conn, &self.site)?;
+
         let is_account_like = { |table: &Table| account_like.contains(table.name.as_str()) };
 
         let changed_tables: Vec<_> = self
@@ -891,9 +962,10 @@ impl Layout {
             .values()
             .filter(|table| table.is_account_like != is_account_like(table.as_ref()))
             .collect();
-        if changed_tables.is_empty() && site == self.site {
+        if changed_tables.is_empty() && site == self.site && history_blocks == self.history_blocks {
             return Ok(self);
         }
+
         let mut layout = (*self).clone();
         for table in changed_tables.into_iter() {
             let mut table = (*table.as_ref()).clone();
@@ -901,6 +973,7 @@ impl Layout {
             layout.tables.insert(table.object.clone(), Arc::new(table));
         }
         layout.site = site;
+        layout.history_blocks = history_blocks;
         Ok(Arc::new(layout))
     }
 }
@@ -968,7 +1041,7 @@ impl ColumnType {
 
         // Check if it's an enum, and if it is, return an appropriate
         // ColumnType::Enum
-        if let Some(values) = enums.get(&*name) {
+        if let Some(values) = enums.get(name) {
             // We do things this convoluted way to make sure field_type gets
             // snakecased, but the `.` must stay a `.`
             let name = SqlName::qualified_name(&catalog.site.namespace, &SqlName::from(name));
@@ -1046,7 +1119,7 @@ impl Column {
         enums: &EnumMap,
         id_types: &IdTypeMap,
     ) -> Result<Column, StoreError> {
-        SqlName::check_valid_identifier(&*field.name, "attribute")?;
+        SqlName::check_valid_identifier(&field.name, "attribute")?;
 
         let sql_name = SqlName::from(&*field.name);
         let is_reference =
@@ -1206,6 +1279,10 @@ pub struct Table {
     /// Entities in this table are immutable, i.e., will never be updated or
     /// deleted
     pub(crate) immutable: bool,
+
+    /// Whether this table has an explicit `causality_region` column. If `false`, then the column is
+    /// not present and the causality region for all rows is implicitly `0` (equivalent to CasualityRegion::ONCHAIN).
+    pub(crate) has_causality_region: bool,
 }
 
 impl Table {
@@ -1216,8 +1293,9 @@ impl Table {
         enums: &EnumMap,
         id_types: &IdTypeMap,
         position: u32,
+        has_causality_region: bool,
     ) -> Result<Table, StoreError> {
-        SqlName::check_valid_identifier(&*defn.name, "object")?;
+        SqlName::check_valid_identifier(&defn.name, "object")?;
 
         let table_name = SqlName::from(&*defn.name);
         let columns = defn
@@ -1241,6 +1319,7 @@ impl Table {
             columns,
             position,
             immutable,
+            has_causality_region,
         };
         Ok(table)
     }
@@ -1251,11 +1330,12 @@ impl Table {
         let other = Table {
             object: self.object.clone(),
             name: name.clone(),
-            qualified_name: SqlName::qualified_name(namespace, &name),
+            qualified_name: SqlName::qualified_name(namespace, name),
             columns: self.columns.clone(),
             is_account_like: self.is_account_like,
             position: self.position,
             immutable: self.immutable,
+            has_causality_region: self.has_causality_region,
         };
 
         Arc::new(other)
@@ -1315,6 +1395,14 @@ impl Table {
         conn.execute(&sql)?;
         Ok(())
     }
+
+    pub(crate) fn block_column(&self) -> &SqlName {
+        if self.immutable {
+            &crate::block_range::BLOCK_COLUMN_SQL
+        } else {
+            &crate::block_range::BLOCK_RANGE_COLUMN_SQL
+        }
+    }
 }
 
 /// Return the enclosed named type for a field type, i.e., the type after
@@ -1330,7 +1418,7 @@ fn named_type(field_type: &q::Type) -> &str {
 fn is_object_type(field_type: &q::Type, enums: &EnumMap) -> bool {
     let name = named_type(field_type);
 
-    !enums.contains_key(&*name) && !ValueType::is_scalar(name)
+    !enums.contains_key(name) && !ValueType::is_scalar(name)
 }
 
 #[derive(Clone)]
@@ -1362,7 +1450,8 @@ impl LayoutCache {
 
     fn load(conn: &PgConnection, site: Arc<Site>) -> Result<Arc<Layout>, StoreError> {
         let (subgraph_schema, use_bytea_prefix) = deployment::schema(conn, site.as_ref())?;
-        let catalog = Catalog::load(conn, site.clone(), use_bytea_prefix)?;
+        let has_causality_region = deployment::entities_with_causality_region(conn, site.id)?;
+        let catalog = Catalog::load(conn, site.clone(), use_bytea_prefix, has_causality_region)?;
         let layout = Arc::new(Layout::new(site.clone(), &subgraph_schema, catalog)?);
         layout.refresh(conn, site)
     }
@@ -1442,6 +1531,14 @@ impl LayoutCache {
                 Ok(layout)
             }
         }
+    }
+
+    pub(crate) fn remove(&self, site: &Site) -> Option<Arc<Layout>> {
+        self.entries
+            .lock()
+            .unwrap()
+            .remove(&site.deployment)
+            .map(|CacheEntry { value, expires: _ }| value)
     }
 
     // Only needed for tests
